@@ -4,6 +4,7 @@
 
 mod app;
 mod document;
+mod icons;
 
 use std::path::PathBuf;
 
