@@ -592,7 +592,22 @@ impl MdViewApp {
 
             match mode {
                 ViewMode::Rendered => {
-                    egui::ScrollArea::vertical()
+                    // Полосы прокрутки по умолчанию плавающие: рисуются
+                    // поверх текста. Здесь это мешает — переводим на solid,
+                    // чтобы полоса занимала своё место.
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+
+                    // Обе оси, а не только вертикальная. Иначе широкая
+                    // таблица просто обрезается по краю области и становится
+                    // недостижимой — для просмотрщика это потеря содержимого.
+                    //
+                    // Перенос абзацев при этом не ломается: egui задаёт
+                    // внутреннему Ui ширину видимой области, а не бесконечную
+                    // («better to wrap text and shrink images than showing
+                    // a horizontal scrollbar» — комментарий в scroll_area.rs),
+                    // так что текст по-прежнему укладывается в колонку,
+                    // а вылезает только то, что физически шире.
+                    egui::ScrollArea::both()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
                             centered_column(ui, MAX_CONTENT_WIDTH, |ui| {
@@ -1310,17 +1325,32 @@ fn menu_bar(
 /// у левого края. Поэтому слева добавляется отступ в половину остатка,
 /// а содержимое рисуется во вложенном `Ui` с обычной вёрсткой сверху вниз —
 /// текст внутри колонки должен остаться выключенным влево, а не по центру.
+/// Отступ слева, при котором колонка шириной `desired` встанет по центру
+/// области шириной `available`.
+///
+/// Вынесено из отрисовки отдельной функцией по одной причине: это
+/// арифметика, а арифметику можно проверить тестом без окна. Ошибку
+/// в ней иначе ловят глазами по скриншотам, а это плохой способ.
+///
+/// Ограничение снизу нулём не для красоты: если колонка шире доступного
+/// места, отступ ушёл бы в минус и вёрстка поехала бы. Так колонка
+/// максимум прижмётся влево, а горизонтальная прокрутка её достанет.
+fn column_offset(available: f32, desired: f32) -> f32 {
+    let width = available.min(desired);
+    ((available - width) / 2.0).max(0.0)
+}
+
 fn centered_column<R>(
     ui: &mut egui::Ui,
     desired_width: f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    // `available_width` спрашивается заново каждый кадр и относится
+    // к области содержимого — той, что осталась после боковой панели
+    // и полос. Ничего не запоминается между кадрами.
     let available = ui.available_width();
     let width = available.min(desired_width);
-    // max(0) не для красоты: если ширину колонки оценили неверно и она
-    // шире окна, отступ ушёл бы в минус и вёрстка поехала бы. Так колонка
-    // максимум прижмётся влево, а горизонтальная прокрутка её достанет.
-    let side = ((available - width) / 2.0).max(0.0);
+    let side = column_offset(available, desired_width);
 
     ui.horizontal_top(|ui| {
         ui.add_space(side);
@@ -1819,6 +1849,39 @@ mod tests {
         assert_eq!(form(111), "строк");
         assert_eq!(form(121), "строка");
         assert_eq!(form(0), "строк");
+    }
+
+    #[test]
+    fn column_offset_is_symmetric() {
+        // Слева столько же, сколько останется справа.
+        for (available, desired) in [(1000.0, 600.0), (1452.0, 900.0), (300.5, 100.25)] {
+            let side = column_offset(available, desired);
+            let width = available.min(desired);
+            let right = available - side - width;
+            assert!(
+                (side - right).abs() < 0.001,
+                "не по центру: доступно {available}, колонка {desired}, слева {side}, справа {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_offset_is_zero_when_column_does_not_fit() {
+        // Колонка шире доступного места — прижимаем влево, а не в минус.
+        assert_eq!(column_offset(400.0, 900.0), 0.0);
+        assert_eq!(column_offset(900.0, 900.0), 0.0);
+        assert_eq!(column_offset(0.0, 900.0), 0.0);
+    }
+
+    #[test]
+    fn column_offset_matches_measured_values() {
+        // Числа сняты с живой сборки: окно 1800, колонка 900.
+        // С открытой боковой панелью доступно 1452, без неё 1768.
+        assert_eq!(column_offset(1452.0, 900.0), 276.0);
+        assert_eq!(column_offset(1768.0, 900.0), 434.0);
+        // Разница отступов — ровно половина ширины панели (316).
+        let shift = column_offset(1768.0, 900.0) - column_offset(1452.0, 900.0);
+        assert_eq!(shift, 316.0 / 2.0);
     }
 
     #[test]
