@@ -5,6 +5,9 @@
 mod app;
 mod document;
 mod icons;
+mod outline;
+mod rendered_probe;
+mod search;
 
 use std::path::PathBuf;
 

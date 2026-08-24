@@ -13,6 +13,9 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::document::{self, Document};
 use crate::icons::{self, Icon, Segment};
+use crate::rendered_probe::{self, ProbeBroken};
+use crate::search;
+use std::ops::Range;
 
 /// Ширина колонки текста. Длинные строки на весь монитор читать невозможно.
 const MAX_CONTENT_WIDTH: f32 = 900.0;
@@ -38,6 +41,149 @@ const SELECT_ALL_SHORTCUT: egui::KeyboardShortcut =
 /// доходит как `Event::Copy`, а не как нажатие клавиши, и ловится иначе.
 const COPY_SHORTCUT_HINT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C);
+const OUTLINE_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B);
+
+/// Ключ в хранилище eframe.
+///
+/// Значение кладём строкой через `Storage::set_string`, а не структурой
+/// с serde-производными: поле пока одно. Когда на Этапе 2 их станет
+/// десяток, отдельная структура настроек окупится, сейчас — нет.
+///
+/// Ширины панели здесь нет намеренно: её сохраняет и восстанавливает сама
+/// egui — при включённой фиче persistence геометрия панелей уезжает
+/// в то же хранилище. Свой ключ на неё заводить бессмысленно, он всё равно
+/// проигрывал бы состоянию egui при загрузке. Проверено: правка сохранённой
+/// egui-геометрии меняет ширину панели при следующем запуске.
+const KEY_OUTLINE_OPEN: &str = "outline_open";
+
+const OUTLINE_DEFAULT_WIDTH: f32 = 240.0;
+
+const FIND_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F);
+
+/// Состояние поиска.
+///
+/// Совпадения считаются по разному тексту в разных режимах: в «Исходнике» —
+/// по исходнику, в «Рендере» — по извлечённому простому тексту. Поэтому
+/// подготовленный `Haystack` помнит, для какого режима он сделан,
+/// и пересобирается при переключении.
+#[derive(Default)]
+struct Search {
+    open: bool,
+    query: String,
+    options: search::Options,
+    matches: Vec<Range<usize>>,
+    /// Номер текущего совпадения. Осмыслен, только если `matches` не пуст.
+    current: usize,
+    prepared: Option<Prepared>,
+    /// Поставить фокус в поле на следующем кадре.
+    request_focus: bool,
+    /// Сколько совпадений удалось подсветить в «Рендере».
+    ///
+    /// Меньше общего числа, если совпадение разрезано разметкой:
+    /// такой фрагмент рисуется двумя разными galley, и найти его целиком
+    /// в нарисованном невозможно.
+    highlighted: usize,
+    /// Чтение слоя графики перестало работать. См. `rendered_probe`.
+    probe_broken: bool,
+    /// Входные данные, для которых уже посчитаны совпадения.
+    ///
+    /// Без этого `refresh` пересчитывал бы всё каждый кадр — около двух
+    /// миллисекунд на файле 5 МБ, то есть восьмая часть кадрового бюджета
+    /// впустую, пока открыт поиск.
+    computed_for: Option<(String, search::Options, ViewMode)>,
+}
+
+struct Prepared {
+    mode: ViewMode,
+    /// Простой текст для «Рендера». Для «Исходника» пуст: там ищем прямо
+    /// по `document.source()`, лишняя копия не нужна.
+    plain: String,
+    haystack: search::Haystack,
+}
+
+impl Search {
+    /// Текст, по которому идёт поиск в текущем режиме.
+    fn text<'a>(&'a self, document: &'a Document) -> &'a str {
+        match self.prepared.as_ref() {
+            Some(prepared) if prepared.mode == ViewMode::Rendered => &prepared.plain,
+            _ => document.source(),
+        }
+    }
+
+    /// Пересчитывает совпадения, если что-то изменилось.
+    ///
+    /// Подготовка текста (свёртка регистра) стоит около 28 мс на файле 5 МБ,
+    /// поэтому делается только при смене документа или режима, а не на каждое
+    /// нажатие: сам поиск после неё занимает около двух миллисекунд.
+    fn refresh(&mut self, document: &Document, mode: ViewMode) {
+        let inputs = (self.query.clone(), self.options, mode);
+        if self.computed_for.as_ref() == Some(&inputs) {
+            return;
+        }
+        self.computed_for = Some(inputs);
+
+        let needs_prepare = self
+            .prepared
+            .as_ref()
+            .is_none_or(|prepared| prepared.mode != mode);
+
+        if needs_prepare {
+            let plain = match mode {
+                ViewMode::Rendered => crate::outline::plain_text(document.source()),
+                ViewMode::Source => String::new(),
+            };
+            let haystack = match mode {
+                ViewMode::Rendered => search::Haystack::new(&plain),
+                ViewMode::Source => search::Haystack::new(document.source()),
+            };
+            self.prepared = Some(Prepared {
+                mode,
+                plain,
+                haystack,
+            });
+        }
+
+        let Some(prepared) = self.prepared.as_ref() else {
+            return;
+        };
+        let text = match mode {
+            ViewMode::Rendered => prepared.plain.as_str(),
+            ViewMode::Source => document.source(),
+        };
+
+        self.matches = prepared.haystack.find_all(text, &self.query, self.options);
+        self.current = self.current.min(self.matches.len().saturating_sub(1));
+    }
+
+    /// Сбрасывает подготовку — например, когда открыли другой файл.
+    fn invalidate(&mut self) {
+        self.prepared = None;
+        self.computed_for = None;
+        self.matches.clear();
+        self.current = 0;
+    }
+
+    fn step(&mut self, forward: bool) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let last = self.matches.len() - 1;
+        self.current = if forward {
+            if self.current >= last {
+                0
+            } else {
+                self.current + 1
+            }
+        } else if self.current == 0 {
+            last
+        } else {
+            self.current - 1
+        };
+    }
+}
+
 /// Скрытое сочетание: галерея иконок. В меню его нет намеренно.
 const GALLERY_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
     egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
@@ -96,6 +242,14 @@ struct Actions {
     copy_all: bool,
     /// Показать/спрятать отладочную галерею иконок.
     gallery: bool,
+    /// Свернуть/развернуть боковую панель с оглавлением.
+    toggle_outline: bool,
+    /// Открыть поиск и поставить в него фокус.
+    find: bool,
+    /// Закрыть поиск.
+    close_find: bool,
+    /// Перейти к следующему (`true`) или предыдущему совпадению.
+    step_match: Option<bool>,
     /// Включить или выключить слежение за файлом.
     watch: Option<bool>,
     /// Закрыть приложение.
@@ -147,10 +301,26 @@ pub struct MdViewApp {
     about_open: bool,
     /// Открыто ли окно «Горячие клавиши».
     shortcuts_open: bool,
+    /// Развёрнута ли боковая панель с оглавлением.
+    outline_open: bool,
+    /// Строка, к которой надо прокрутить «Исходник» на следующем кадре.
+    pending_scroll_line: Option<usize>,
+    /// Первая видимая строка в «Исходнике» — по ней подсвечивается
+    /// текущий раздел в оглавлении. Заполняется при отрисовке.
+    first_visible_line: usize,
+    /// Поиск по документу.
+    search: Search,
 }
 
 impl MdViewApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+        // Хранилище есть только при включённой фиче persistence и только
+        // если eframe сумел его открыть, поэтому всюду значения по умолчанию.
+        let stored = |key: &str| cc.storage.and_then(|storage| storage.get_string(key));
+        let outline_open = stored(KEY_OUTLINE_OPEN)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(true);
+
         // Без этого картинки в markdown не отрисуются вообще.
         egui_extras::install_image_loaders(&cc.egui_ctx);
         install_fonts(&cc.egui_ctx);
@@ -158,6 +328,7 @@ impl MdViewApp {
         // Метода style_mut больше нет; all_styles_mut правит оба разом.
         cc.egui_ctx
             .all_styles_mut(|style| style.url_in_tooltip = true);
+        install_code_colors(&cc.egui_ctx);
 
         let mut app = Self {
             document: None,
@@ -172,6 +343,10 @@ impl MdViewApp {
             gallery_open: false,
             about_open: false,
             shortcuts_open: false,
+            outline_open,
+            pending_scroll_line: None,
+            first_visible_line: 0,
+            search: Search::default(),
         };
 
         if let Some(path) = initial {
@@ -195,6 +370,7 @@ impl MdViewApp {
                 };
                 self.error = None;
                 self.select_all = false;
+                self.search.invalidate();
                 self.document = Some(document);
             }
             Err(err) => {
@@ -224,8 +400,11 @@ impl MdViewApp {
             document,
             mode,
             auto_reload,
+            outline_open,
+            search,
             ..
         } = self;
+        let search_open = search.open;
 
         let mut actions = Actions::default();
         let has_document = document.is_some();
@@ -233,7 +412,14 @@ impl MdViewApp {
         // В 0.36 SidePanel и TopBottomPanel слились в один тип Panel,
         // и панель прикрепляется к Ui, а не к Context.
         egui::Panel::top("toolbar").show(ui, |ui| {
-            menu_bar(ui, &mut actions, has_document, *mode, *auto_reload);
+            menu_bar(
+                ui,
+                &mut actions,
+                has_document,
+                *mode,
+                *auto_reload,
+                *outline_open,
+            );
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -242,6 +428,26 @@ impl MdViewApp {
                 // Клон дешёвый — внутри Arc.
                 let ctx = ui.ctx().clone();
                 let shortcut = |s| ctx.format_shortcut(s);
+
+                let outline_hint = format!("Оглавление ({})", shortcut(&OUTLINE_SHORTCUT));
+                if icons::icon_toggle(ui, Icon::Sidebar, outline_open, &outline_hint).clicked() {
+                    // icon_toggle уже переключил флаг; отдельного намерения
+                    // не нужно, состояние панели живёт прямо в приложении.
+                }
+
+                // Поиск, в отличие от оглавления, флагом не обойдёшься:
+                // открытие должно ещё и поставить фокус в поле. Поэтому
+                // кнопка отдаёт намерение, а переключает уже приложение —
+                // тем же путём, что и Ctrl+F.
+                let search_hint = format!("Поиск ({})", shortcut(&FIND_SHORTCUT));
+                let mut search_on = search_open;
+                if icons::icon_toggle(ui, Icon::Search, &mut search_on, &search_hint).clicked() {
+                    if search_on {
+                        actions.find = true;
+                    } else {
+                        actions.close_find = true;
+                    }
+                }
 
                 if icons::icon_button(
                     ui,
@@ -336,6 +542,21 @@ impl MdViewApp {
     /// Рисует содержимое. Возвращает `true`, если пользователь нажал
     /// «Всё равно отрисовать» на предупреждении о большом файле.
     fn content(&mut self, ui: &mut egui::Ui) -> bool {
+        let scroll_to_line = self.pending_scroll_line.take();
+        let mut first_visible = self.first_visible_line;
+        // Подсветку передаём только когда поиск открыт и ищет по исходнику:
+        // в «Рендере» смещения указывают в другой текст.
+        let highlight = (self.search.open && self.mode == ViewMode::Source).then_some(Highlight {
+            matches: self.search.matches.as_slice(),
+            current: self.search.current,
+        });
+        // Слой графики обходим только при живом запросе — не каждый кадр.
+        let probe_query =
+            (self.search.open && self.mode == ViewMode::Rendered && !self.search.query.is_empty())
+                .then(|| self.search.query.clone());
+        let probe_options = self.search.options;
+        let mut probe_result: Option<Result<usize, ProbeBroken>> = None;
+
         let Self {
             document,
             error,
@@ -374,15 +595,52 @@ impl MdViewApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            centered_column(ui, |ui| {
-                                CommonMarkViewer::new().show(ui, cache, document.rendered());
+                            centered_column(ui, MAX_CONTENT_WIDTH, |ui| {
+                                // Подсветку рисуем ПОД текстом: место под неё
+                                // резервируем заранее пустой фигурой, а после
+                                // отрисовки документа подменяем настоящей.
+                                // Иначе прямоугольники легли бы поверх букв.
+                                let slot = ui.painter().add(egui::Shape::Noop);
+                                let mark = rendered_probe::mark(ui.ctx(), ui.layer_id());
+
+                                CommonMarkViewer::new()
+                                    // Без этого крейт не включит разбор
+                                    // атрибутов `{#id}`, и вставленные
+                                    // нами якоря будут просто текстом.
+                                    .enable_scroll_to_heading(true)
+                                    .show(ui, cache, document.rendered());
+
+                                if let Some(query) = probe_query {
+                                    probe_result = Some(highlight_rendered(
+                                        ui,
+                                        slot,
+                                        mark,
+                                        query,
+                                        probe_options,
+                                    ));
+                                }
                             });
                         });
                 }
-                ViewMode::Source => draw_source(ui, document, select_all),
+                ViewMode::Source => {
+                    first_visible =
+                        draw_source(ui, document, select_all, scroll_to_line, highlight);
+                }
             }
         });
 
+        self.first_visible_line = first_visible;
+        match probe_result {
+            Some(Ok(count)) => {
+                self.search.highlighted = count;
+                self.search.probe_broken = false;
+            }
+            Some(Err(ProbeBroken)) => {
+                self.search.highlighted = 0;
+                self.search.probe_broken = true;
+            }
+            None => {}
+        }
         render_anyway
     }
 
@@ -406,6 +664,180 @@ impl MdViewApp {
 
         ctx.copy_text(text.to_owned());
         self.notice = Some((message, Instant::now()));
+    }
+
+    /// Полоса поиска. Живёт под тулбаром и внутри области содержимого —
+    /// то есть правее оглавления и над самим текстом, а не поверх него.
+    fn show_search(&mut self, ui: &mut egui::Ui) {
+        if !self.search.open {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+
+        // Пересчёт до отрисовки: счётчик в полосе должен показывать
+        // то же, что подсвечено в тексте на этом же кадре.
+        let mode = self.mode;
+        let before = (self.search.query.clone(), self.search.options);
+        let mut stepped = None;
+        let mut close = false;
+
+        egui::Panel::top("search").show(ui, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.search.query)
+                        .hint_text("Найти")
+                        .desired_width(220.0),
+                );
+                if std::mem::take(&mut self.search.request_focus) {
+                    field.request_focus();
+                }
+                // Enter в поле — к следующему совпадению, как в редакторах.
+                if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    stepped = Some(true);
+                    field.request_focus();
+                }
+
+                if ui
+                    .button("<")
+                    .on_hover_text("Предыдущее (Shift+F3)")
+                    .clicked()
+                {
+                    stepped = Some(false);
+                }
+                if ui.button(">").on_hover_text("Следующее (F3)").clicked() {
+                    stepped = Some(true);
+                }
+
+                ui.checkbox(&mut self.search.options.case_sensitive, "Аа")
+                    .on_hover_text("Учитывать регистр");
+                ui.checkbox(&mut self.search.options.whole_word, "|аб|")
+                    .on_hover_text("Слово целиком");
+
+                ui.separator();
+                let (label, hint) = search_status(&self.search, mode);
+                let response = ui.label(label);
+                if let Some(hint) = hint {
+                    response.on_hover_text(hint);
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::icon_button(ui, Icon::Close, "Закрыть поиск (Esc)").clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        });
+
+        if (self.search.query.clone(), self.search.options) != before {
+            self.search.current = 0;
+        }
+        self.search.refresh(document, mode);
+
+        if let Some(forward) = stepped {
+            self.search.step(forward);
+            self.scroll_to_current_match();
+        }
+        if close {
+            self.search.open = false;
+        }
+    }
+
+    /// Прокручивает к текущему совпадению.
+    ///
+    /// В «Исходнике» смещение совпадения переводится в номер строки —
+    /// точно. В «Рендере» точной прокрутки пока нет: позиции текста
+    /// на экране добываются чтением слоя графики, и этим занимается
+    /// отдельный шаг; здесь — прокрутка к ближайшему заголовку выше
+    /// совпадения, чтобы человек хотя бы попал в нужный раздел.
+    fn scroll_to_current_match(&mut self) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        let Some(range) = self.search.matches.get(self.search.current) else {
+            return;
+        };
+
+        match self.mode {
+            ViewMode::Source => {
+                let line = document.line_of_offset(range.start);
+                // Пара строк сверху, чтобы совпадение не липло к краю.
+                self.pending_scroll_line = Some(line.saturating_sub(2));
+            }
+            ViewMode::Rendered => {
+                // Смещение здесь — в простом тексте, а не в исходнике,
+                // поэтому номер строки исходника из него не получить.
+                // Ближайший заголовок ищем по порядковому номеру совпадения
+                // в простом тексте: заголовки в нём идут в том же порядке.
+                let plain = self.search.text(document);
+                let before = &plain[..range.start];
+                let slug = document
+                    .headings()
+                    .iter()
+                    .filter(|heading| !heading.slug.is_empty())
+                    .rfind(|heading| {
+                        !heading.text.is_empty() && before.contains(heading.text.as_str())
+                    })
+                    .map(|heading| heading.slug.clone());
+
+                if let Some(slug) = slug {
+                    *self.cache.scroll_to_id_target_mut() = Some(slug);
+                }
+            }
+        }
+    }
+
+    /// Боковая панель с оглавлением и обработка перехода по её пунктам.
+    fn show_outline(&mut self, ui: &mut egui::Ui) {
+        if !self.outline_open {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+
+        // В «Исходнике» текущий раздел известен: первая видимая строка
+        // приходит из виртуализации. В «Рендере» её взять неоткуда,
+        // не залезая во внутренности egui, — поэтому там подсветки нет.
+        let current = match self.mode {
+            ViewMode::Source => current_heading(document.headings(), self.first_visible_line),
+            ViewMode::Rendered => None,
+        };
+
+        let clicked = outline_panel(ui, document.headings(), current);
+
+        let Some(index) = clicked else {
+            return;
+        };
+        let Some(heading) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.headings().get(index))
+        else {
+            return;
+        };
+
+        match self.mode {
+            // Режим «Рендер»: просим крейт прокрутиться к нашему якорю.
+            // Работает потому, что якоря мы сами и вставили в текст.
+            ViewMode::Rendered => {
+                if heading.slug.is_empty() {
+                    self.notice = Some((
+                        "У заголовка, набранного подчёркиванием, нет якоря —                          перейти можно только в режиме «Исходник»"
+                            .to_owned(),
+                        Instant::now(),
+                    ));
+                } else {
+                    *self.cache.scroll_to_id_target_mut() = Some(heading.slug.clone());
+                }
+            }
+            // Режим «Исходник»: номер строки известен точно, прокручиваем сами.
+            ViewMode::Source => self.pending_scroll_line = Some(heading.line),
+        }
     }
 
     /// Короткое уведомление внизу окна. Гаснет само.
@@ -445,6 +877,26 @@ impl MdViewApp {
             self.shown_title = title;
         }
     }
+}
+
+/// Цвет фона встроенного кода — отдельно для каждой темы.
+///
+/// Умолчания egui для этой роли неудачны в обе стороны: в тёмной теме
+/// `from_gray(64)` слишком светлый и лезет в глаза, в светлой
+/// `from_gray(230)` почти не отличим от белого фона. Задаём свои,
+/// с лёгким холодным оттенком, чтобы код читался как код.
+///
+/// Это единственный рычаг, который `egui_commonmark 0.25` оставляет
+/// для встроенного кода: он вызывает `RichText::code()`, а тот берёт
+/// фон из `visuals.code_bg_color`. Цвет самого текста и высоту заливки
+/// крейт наружу не отдаёт.
+fn install_code_colors(ctx: &egui::Context) {
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.visuals.code_bg_color = egui::Color32::from_rgb(48, 54, 66);
+    });
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        style.visuals.code_bg_color = egui::Color32::from_rgb(226, 230, 239);
+    });
 }
 
 /// Подключает вшитые в бинарник шрифты.
@@ -554,6 +1006,132 @@ fn shortcuts_window(ctx: &egui::Context, open: &mut bool) {
         });
 }
 
+/// Подпись счётчика и, если есть что сказать, пояснение к ней.
+///
+/// Возвращает саму подпись и текст всплывающей подсказки.
+fn search_status(search: &Search, mode: ViewMode) -> (egui::RichText, Option<String>) {
+    let scope = match mode {
+        ViewMode::Rendered => "в тексте",
+        ViewMode::Source => "в исходнике",
+    };
+
+    if search.query.is_empty() {
+        return (egui::RichText::new(scope).weak(), None);
+    }
+    if search.matches.is_empty() {
+        return (
+            egui::RichText::new(format!("нет совпадений · {scope}")).weak(),
+            None,
+        );
+    }
+
+    let mut label = format!(
+        "{} из {} · {scope}",
+        search.current + 1,
+        search.matches.len()
+    );
+    let mut hint = None;
+
+    if mode == ViewMode::Rendered {
+        if search.probe_broken {
+            label.push_str(" · подсветка не работает");
+            hint = Some(
+                "Подсветка в режиме «Рендер» опирается на внутреннее устройство egui и перестала работать — вероятно, после обновления библиотеки. Счётчик и переходы при этом верны. В режиме «Исходник» подсветка есть."
+                    .to_owned(),
+            );
+        } else {
+            let missed = search.matches.len().saturating_sub(search.highlighted);
+            if missed > 0 {
+                label.push_str(&format!(" · {missed} без подсветки"));
+                hint = Some(format!(
+                    "{missed} {} попало внутрь разметки — жирного текста, кода или ссылки. Такое совпадение рисуется двумя отдельными кусками, и подсветить его целиком нельзя. В счётчике и переходах оно учтено. В режиме «Исходник» подсвечивается всё.",
+                    plural(missed, "совпадение", "совпадения", "совпадений")
+                ));
+            }
+        }
+    }
+
+    (egui::RichText::new(label), hint)
+}
+
+/// Боковая панель с оглавлением.
+///
+/// Возвращает номер заголовка, по которому кликнули.
+/// Ширину меняет сама панель — `Panel` пишет её обратно в `width`,
+/// чтобы растянутая мышью величина пережила перезапуск.
+fn outline_panel(
+    ui: &mut egui::Ui,
+    headings: &[crate::outline::Heading],
+    current: Option<usize>,
+) -> Option<usize> {
+    let mut clicked = None;
+
+    // Ширину дальше ведёт сама egui: `default_size` действует только на
+    // первый запуск, потом побеждает сохранённая геометрия панели.
+    egui::Panel::left("outline")
+        .resizable(true)
+        .default_size(OUTLINE_DEFAULT_WIDTH)
+        .min_size(140.0)
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Оглавление").strong());
+            ui.separator();
+
+            if headings.is_empty() {
+                ui.label(egui::RichText::new("Заголовков нет").weak());
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    for (index, heading) in headings.iter().enumerate() {
+                        // Отступ по уровню — иначе структура документа
+                        // в плоском списке не читается.
+                        let indent = (heading.level.saturating_sub(1)) as f32 * 12.0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(indent);
+
+                            let label = if heading.text.is_empty() {
+                                "(без названия)"
+                            } else {
+                                heading.text.as_str()
+                            };
+                            let selected = current == Some(index);
+                            let button = egui::Button::selectable(selected, label)
+                                .wrap_mode(egui::TextWrapMode::Truncate);
+
+                            let mut response = ui.add(button);
+                            if !heading.is_atx {
+                                // Честно предупреждаем: у setext-заголовка
+                                // якоря нет, и в режиме «Рендер» клик
+                                // никуда не приведёт.
+                                response = response.on_hover_text(
+                                    "Заголовок подчёркиванием: в режиме «Рендер»                                      перехода не будет, только в «Исходнике»",
+                                );
+                            }
+                            if response.clicked() {
+                                clicked = Some(index);
+                            }
+                        });
+                    }
+                });
+        });
+
+    clicked
+}
+
+/// Номер заголовка, в разделе которого мы сейчас находимся.
+///
+/// Считается от строки, а не от последнего клика: иначе прокрутка колесом
+/// и переход по совпадению поиска дрались бы за подсветку.
+fn current_heading(headings: &[crate::outline::Heading], line: usize) -> Option<usize> {
+    // `take_while` не умеет ходить назад, поэтому ищем позицию первого
+    // заголовка ниже текущей строки и берём предыдущий.
+    let after = headings.partition_point(|heading| heading.line <= line);
+    after.checked_sub(1)
+}
+
 /// Строка меню: Файл, Правка, Вид, Справка.
 ///
 /// Нативного меню Windows тут нет и быть не может: egui рисует интерфейс
@@ -568,6 +1146,7 @@ fn menu_bar(
     has_document: bool,
     mode: ViewMode,
     watching: bool,
+    outline_open: bool,
 ) {
     let ctx = ui.ctx().clone();
     // Пункт с подписью сочетания справа — как принято в настольных
@@ -660,6 +1239,16 @@ fn menu_bar(
             ui.separator();
 
             if ui
+                .add(
+                    egui::Button::selectable(outline_open, "Оглавление")
+                        .shortcut_text(ctx.format_shortcut(&OUTLINE_SHORTCUT)),
+                )
+                .clicked()
+            {
+                actions.toggle_outline = true;
+                ui.close();
+            }
+            if ui
                 .add(egui::Button::selectable(watching, "Следить за файлом"))
                 .clicked()
             {
@@ -721,9 +1310,16 @@ fn menu_bar(
 /// у левого края. Поэтому слева добавляется отступ в половину остатка,
 /// а содержимое рисуется во вложенном `Ui` с обычной вёрсткой сверху вниз —
 /// текст внутри колонки должен остаться выключенным влево, а не по центру.
-fn centered_column<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+fn centered_column<R>(
+    ui: &mut egui::Ui,
+    desired_width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     let available = ui.available_width();
-    let width = available.min(MAX_CONTENT_WIDTH);
+    let width = available.min(desired_width);
+    // max(0) не для красоты: если ширину колонки оценили неверно и она
+    // шире окна, отступ ушёл бы в минус и вёрстка поехала бы. Так колонка
+    // максимум прижмётся влево, а горизонтальная прокрутка её достанет.
     let side = ((available - width) / 2.0).max(0.0);
 
     ui.horizontal_top(|ui| {
@@ -744,33 +1340,179 @@ fn centered_column<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
 /// одним `Label`, а не строкой на виджет: так внутри окна работает обычное
 /// выделение мышью через несколько строк, и высота ряда совпадает
 /// с расчётной без возни с межстрочными интервалами.
-fn draw_source(ui: &mut egui::Ui, document: &Document, select_all: bool) {
+/// Что подсветить в исходнике.
+#[derive(Clone, Copy)]
+struct Highlight<'a> {
+    /// Байтовые диапазоны внутри `document.source()`, по возрастанию.
+    matches: &'a [Range<usize>],
+    current: usize,
+}
+
+fn draw_source(
+    ui: &mut egui::Ui,
+    document: &Document,
+    select_all: bool,
+    scroll_to_line: Option<usize>,
+    highlight: Option<Highlight<'_>>,
+) -> usize {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+
+    // Шрифт моноширинный, поэтому ширина колонки считается точно:
+    // самая длинная строка на ширину глифа. Ради этого и держим
+    // `max_line_chars` в документе.
+    let glyph_width = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, '0'));
+    let column_width = document.max_line_columns() as f32 * glyph_width;
 
     // Интервал обнуляем ДО вызова: show_rows читает его из этого `ui`,
     // чтобы посчитать общую высоту. Поменять его внутри замыкания — значит
     // разъехаться с собственным расчётом прокрутки.
     ui.spacing_mut().item_spacing.y = 0.0;
 
-    egui::ScrollArea::both().auto_shrink([false; 2]).show_rows(
-        ui,
-        row_height,
-        document.line_count(),
-        |ui, rows| {
-            let visible: Vec<&str> = rows.map(|index| document.line(index)).collect();
-            let mut text = egui::RichText::new(visible.join("\n")).monospace();
-            // После Ctrl+A подсвечиваем видимые строки цветом выделения.
-            // Это именно индикация: выделен весь документ, а не эти строки.
-            if select_all {
-                text = text.background_color(ui.visuals().selection.bg_fill);
-            }
+    let mut area = egui::ScrollArea::both().auto_shrink([false; 2]);
+    if let Some(line) = scroll_to_line {
+        // Прокрутка считается арифметикой, а не поиском виджета: все строки
+        // одной высоты, поэтому смещение — это просто номер строки на высоту.
+        area = area.vertical_scroll_offset(line as f32 * row_height);
+    }
+
+    let mut first_visible = 0;
+    area.show_rows(ui, row_height, document.line_count(), |ui, rows| {
+        first_visible = rows.start;
+        // Та же центрирующая обёртка, что и у рендера: два расчёта
+        // разъехались бы при первой же правке. Номера строк из Этапа 4
+        // рисуются внутри неё же — тогда они прилипнут к колонке,
+        // а не к краю окна.
+        centered_column(ui, column_width, |ui| {
+            let job = source_layout(ui, document, rows, select_all, highlight);
             ui.add(
-                egui::Label::new(text)
+                egui::Label::new(job)
                     .selectable(true)
                     .wrap_mode(egui::TextWrapMode::Extend),
             );
+        });
+    });
+
+    first_visible
+}
+
+/// Рисует подсветку совпадений поверх уже отрисованного документа.
+///
+/// Возвращает, сколько совпадений удалось найти на экране. Это число
+/// меньше общего, если совпадение разрезано разметкой, — разницу
+/// показывает счётчик в полосе поиска.
+fn highlight_rendered(
+    ui: &egui::Ui,
+    slot: egui::layers::ShapeIdx,
+    mark: rendered_probe::Mark,
+    query: String,
+    options: search::Options,
+) -> Result<usize, ProbeBroken> {
+    let rects = rendered_probe::locate(ui.ctx(), ui.layer_id(), mark, &query, options)?;
+
+    let colour = ui.visuals().warn_fg_color.gamma_multiply(0.35);
+    let shapes = rects
+        .iter()
+        .map(|rect| egui::Shape::rect_filled(rect.expand(1.0), 2.0, colour))
+        .collect();
+
+    // Подменяем зарезервированную пустышку: подсветка оказывается
+    // под текстом, а не поверх него.
+    ui.painter().set(slot, egui::Shape::Vec(shapes));
+    Ok(rects.len())
+}
+
+/// Собирает раскладку видимых строк, размечая совпадения поиска.
+///
+/// Подсветка делается не прямоугольниками поверх текста, а фоном самих
+/// участков: `LayoutJob` умеет задать `TextFormat::background` на диапазон,
+/// и тогда фон считает сам раскладчик. Ничего не поедет ни при переносе,
+/// ни при смене шрифта, ни при масштабировании.
+fn source_layout(
+    ui: &egui::Ui,
+    document: &Document,
+    rows: std::ops::Range<usize>,
+    select_all: bool,
+    highlight: Option<Highlight<'_>>,
+) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let visuals = ui.visuals();
+    let color = visuals.text_color();
+
+    // Цвета берём из темы, а не из литералов. Все совпадения — приглушённо,
+    // текущее — в полную силу: так принято в редакторах и так видно,
+    // где ты сейчас.
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        background: if select_all {
+            visuals.selection.bg_fill
+        } else {
+            egui::Color32::TRANSPARENT
         },
-    );
+        ..Default::default()
+    };
+    let dim = egui::TextFormat {
+        background: visuals.selection.bg_fill.gamma_multiply(0.45),
+        ..plain.clone()
+    };
+    let bright = egui::TextFormat {
+        background: visuals.warn_fg_color.gamma_multiply(0.75),
+        color: visuals.extreme_bg_color,
+        ..plain.clone()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    // Перенос выключен: строки исходника не должны заворачиваться,
+    // для длинных есть горизонтальная прокрутка.
+    job.wrap.max_width = f32::INFINITY;
+
+    for (position, line_index) in rows.enumerate() {
+        if position > 0 {
+            job.append("\n", 0.0, plain.clone());
+        }
+
+        let range = document.line_range(line_index);
+        let line = document.line(line_index);
+        let Some(highlight) = highlight else {
+            job.append(line, 0.0, plain.clone());
+            continue;
+        };
+
+        // Совпадения отсортированы, поэтому берём срез, пересекающийся
+        // со строкой, двоичным поиском, а не перебором всего списка:
+        // на пятимегабайтном файле их бывают десятки тысяч.
+        let from = highlight
+            .matches
+            .partition_point(|found| found.end <= range.start);
+        let mut cursor = range.start;
+
+        for (index, found) in highlight.matches.iter().enumerate().skip(from) {
+            if found.start >= range.end {
+                break;
+            }
+
+            let start = found.start.max(range.start);
+            let end = found.end.min(range.end);
+            if start > cursor {
+                job.append(&document.source()[cursor..start], 0.0, plain.clone());
+            }
+
+            let format = if index == highlight.current {
+                bright.clone()
+            } else {
+                dim.clone()
+            };
+            job.append(&document.source()[start..end], 0.0, format);
+            cursor = end;
+        }
+
+        if cursor < range.end {
+            job.append(&document.source()[cursor..range.end], 0.0, plain.clone());
+        }
+    }
+
+    job
 }
 
 /// Предупреждение о большом файле. Возвращает `true`, если нажата кнопка.
@@ -835,6 +1577,12 @@ fn draw_placeholder(ui: &mut egui::Ui) {
 impl eframe::App for MdViewApp {
     /// В 0.36 у трейта `App` нет `update(&mut self, ctx, frame)`: приложение
     /// получает корневой `Ui` без полей и фона, а панели прикрепляются к нему.
+    /// Сохранение состояния между запусками. Вызывается eframe при выходе
+    /// и раз в тридцать секунд.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(KEY_OUTLINE_OPEN, self.outline_open.to_string());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Клон дешёвый: Context внутри — это Arc. Клон нужен по делу:
         // `ui.ctx()` одолжил бы `ui` неизменяемо, а ниже он нужен изменяемо.
@@ -852,6 +1600,7 @@ impl eframe::App for MdViewApp {
             .unwrap_or(false);
         // Пока не выделено мышью — Ctrl+C наш; иначе пусть копирует egui.
         let copy_is_ours = self.select_all || !has_selection;
+        let search_open = self.search.open;
 
         let mut actions = ctx.input_mut(|input| {
             // Ctrl+C до нас не доходит как нажатие клавиши: egui-winit
@@ -878,6 +1627,23 @@ impl eframe::App for MdViewApp {
                 select_all: input.consume_shortcut(&SELECT_ALL_SHORTCUT),
                 copy_all,
                 gallery: input.consume_shortcut(&GALLERY_SHORTCUT),
+                toggle_outline: input.consume_shortcut(&OUTLINE_SHORTCUT),
+                find: input.consume_shortcut(&FIND_SHORTCUT),
+                // Esc и F3 разбираем только при открытом поиске, иначе
+                // отняли бы их у остального интерфейса.
+                close_find: search_open
+                    && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                step_match: if search_open {
+                    if input.consume_key(egui::Modifiers::SHIFT, egui::Key::F3) {
+                        Some(false)
+                    } else if input.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                },
                 // Остальные намерения приходят только из меню.
                 ..Actions::default()
             }
@@ -914,6 +1680,10 @@ impl eframe::App for MdViewApp {
         actions.zoom = actions.zoom.or(from_toolbar.zoom);
         actions.about |= from_toolbar.about;
         actions.shortcuts |= from_toolbar.shortcuts;
+        actions.toggle_outline |= from_toolbar.toggle_outline;
+        actions.find |= from_toolbar.find;
+        actions.close_find |= from_toolbar.close_find;
+        actions.step_match = actions.step_match.or(from_toolbar.step_match);
 
         // 4. Выполняем — теперь `self` снова свободен целиком.
         if actions.open {
@@ -933,6 +1703,22 @@ impl eframe::App for MdViewApp {
         }
         if actions.gallery {
             self.gallery_open = !self.gallery_open;
+        }
+        if actions.toggle_outline {
+            self.outline_open = !self.outline_open;
+        }
+        if actions.find {
+            self.search.open = true;
+            self.search.request_focus = true;
+            // Две подсветки сразу — каша; выделение «всего» уступает поиску.
+            self.select_all = false;
+        }
+        if actions.close_find {
+            self.search.open = false;
+        }
+        if let Some(forward) = actions.step_match {
+            self.search.step(forward);
+            self.scroll_to_current_match();
         }
         if let Some(watch) = actions.watch {
             self.auto_reload = watch;
@@ -979,9 +1765,11 @@ impl eframe::App for MdViewApp {
             ctx.request_repaint_after(RELOAD_INTERVAL);
         }
 
-        // 6. Уведомление — до содержимого: центральная панель занимает
-        //    всё, что осталось, поэтому её добавляют последней.
+        // 6. Уведомление и боковая панель — до содержимого: центральная
+        //    панель занимает всё, что осталось, поэтому её добавляют последней.
         self.show_notice(ui);
+        self.show_outline(ui);
+        self.show_search(ui);
 
         // 7. Собственно содержимое.
         if self.content(ui) {

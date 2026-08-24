@@ -1,6 +1,7 @@
 //! Всё, что связано с файлом на диске. GUI сюда не заглядывает —
 //! этот модуль ничего не знает про egui, его можно тестировать отдельно.
 
+use crate::outline::{self, Heading};
 use std::io::Read as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -138,13 +139,22 @@ pub struct Document {
     path: PathBuf,
     /// Текст ровно как в файле — то, что показываем в режиме "Исходник".
     source: String,
-    /// Тот же текст, но с относительными ссылками, развёрнутыми в file:// URI.
+    /// Тот же текст, но подготовленный к показу: к заголовкам дописаны
+    /// якоря, относительные ссылки развёрнуты в file:// URI.
     rendered: String,
+    /// Заголовки документа — для боковой панели с оглавлением.
+    headings: Vec<Heading>,
     /// Время последней записи. `Option`, потому что файл могли удалить.
     modified: Option<SystemTime>,
     /// Стоит ли вообще предлагать режим рендера. Считается один раз
     /// по расширению — путь между перечитываниями не меняется.
     is_markdown: bool,
+    /// Ширина самой длинной строки в знакоместах.
+    ///
+    /// Считается один раз при загрузке — по ней в режиме «Исходник»
+    /// вычисляется ширина колонки. Каждый кадр перебирать строки
+    /// пятимегабайтного файла ради этого было бы расточительством.
+    max_line_columns: usize,
     /// Границы строк внутри `source`.
     ///
     /// Именно диапазоны, а не `Vec<String>`: копия всех строк удвоила бы
@@ -175,10 +185,12 @@ impl Document {
 
         let path = path.to_path_buf();
         let source = read_text(&path)?;
-        let rendered = absolutize_links(&source, path.parent());
+        let headings = outline::extract(&source);
+        let rendered = prepare_for_render(&source, path.parent());
         let modified = mtime(&path);
         let is_markdown = has_markdown_extension(&path);
         let line_ranges = line_ranges(&source);
+        let max_line_columns = max_line_columns(&source, &line_ranges);
 
         Ok(Self {
             path,
@@ -187,6 +199,8 @@ impl Document {
             modified,
             is_markdown,
             line_ranges,
+            max_line_columns,
+            headings,
         })
     }
 
@@ -224,6 +238,31 @@ impl Document {
         self.line_ranges.len()
     }
 
+    /// Длина самой длинной строки в символах.
+    pub fn max_line_columns(&self) -> usize {
+        self.max_line_columns
+    }
+
+    /// Заголовки документа в порядке появления.
+    pub fn headings(&self) -> &[Heading] {
+        &self.headings
+    }
+
+    /// Байтовые границы строки внутри `source`.
+    ///
+    /// Нужны поиску: совпадения хранятся смещениями в весь текст,
+    /// а рисуются построчно.
+    pub fn line_range(&self, index: usize) -> Range<usize> {
+        self.line_ranges.get(index).cloned().unwrap_or(0..0)
+    }
+
+    /// Номер строки, в которую попадает байтовое смещение.
+    pub fn line_of_offset(&self, offset: usize) -> usize {
+        self.line_ranges
+            .partition_point(|range| range.start <= offset)
+            .saturating_sub(1)
+    }
+
     /// Строка по номеру, без копирования: это срез внутрь `source`.
     pub fn line(&self, index: usize) -> &str {
         self.line_ranges
@@ -248,9 +287,12 @@ impl Document {
         // Иначе borrow checker справедливо ругнётся: справа мы читаем
         // self.path, слева пишем в self.source — нельзя одновременно.
         let source = read_text(&self.path)?;
-        let rendered = absolutize_links(&source, self.path.parent());
+        let headings = outline::extract(&source);
+        let rendered = prepare_for_render(&source, self.path.parent());
 
+        self.headings = headings;
         self.line_ranges = line_ranges(&source);
+        self.max_line_columns = max_line_columns(&source, &self.line_ranges);
         self.source = source;
         self.rendered = rendered;
         self.modified = mtime(&self.path);
@@ -305,6 +347,39 @@ fn line_ranges(text: &str) -> Vec<Range<usize>> {
     }
 
     ranges
+}
+
+/// Сколько знакомест занимает табуляция.
+///
+/// Не выдумано: epaint отрисовывает `\t` фиксированным сдвигом
+/// `FontTweak::tab_size * ширина пробела`, а `tab_size` по умолчанию равен
+/// четырём (см. `epaint/src/text/font.rs`). Это именно фиксированный сдвиг,
+/// а не переход к следующей табстопе, поэтому позицию таба в строке знать
+/// не нужно — достаточно посчитать его за четыре знакоместа.
+const TAB_COLUMNS: usize = 4;
+
+/// Ширина самой длинной строки в знакоместах.
+///
+/// В знакоместах, а не в байтах: кириллица в UTF-8 занимает два байта,
+/// и по длине в байтах колонка вышла бы вдвое шире нужного. И не просто
+/// в символах: таб рисуется шире остальных, и файл с табами давал колонку
+/// уже настоящей — строка уезжала за правый край без прокрутки.
+///
+/// Точность держится на том, что шрифт моноширинный. Символы двойной
+/// ширины (иероглифы, часть эмодзи) в неё не укладываются и по-прежнему
+/// дадут заниженную оценку; лечится это только настоящим обмером строк,
+/// который на пятимегабайтном файле стоит слишком дорого.
+fn max_line_columns(text: &str, ranges: &[Range<usize>]) -> usize {
+    ranges
+        .iter()
+        .map(|range| {
+            text[range.clone()]
+                .chars()
+                .map(|ch| if ch == '\t' { TAB_COLUMNS } else { 1 })
+                .sum()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Размер в килобайтах или мегабайтах — для сообщений человеку.
@@ -418,6 +493,15 @@ fn read_text(path: &Path) -> std::io::Result<String> {
 fn mtime(path: &Path) -> Option<SystemTime> {
     // `?` работает и с Option: если metadata вернула Err -> ok() даст None -> выходим.
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Готовит текст к показу в `egui_commonmark`.
+///
+/// Порядок важен. Якоря вставляются по смещениям, посчитанным разбором
+/// исходника, поэтому вставлять их надо ДО того, как переписывание ссылок
+/// поменяет длину текста и сдвинет все смещения.
+fn prepare_for_render(source: &str, base_dir: Option<&Path>) -> String {
+    absolutize_links(&outline::inject_anchors(source), base_dir)
 }
 
 /// Переписывает относительные ссылки вида `](picture.png)` в `](file:///abs/path)`.
@@ -661,6 +745,28 @@ mod tests {
         assert_eq!(line_ranges("одна\n").len(), 1);
         assert_eq!(line_ranges("одна\nдве\n").len(), 2);
         assert_eq!(line_ranges("").len(), 0);
+    }
+
+    #[test]
+    fn tabs_count_as_four_columns() {
+        // Именно ради этого теста таб перестал считаться за один символ:
+        // без него строка с табами уезжала за правый край без прокрутки.
+        let text = "ab\tc";
+        let ranges = line_ranges(text);
+        assert_eq!(max_line_columns(text, &ranges), 2 + 4 + 1);
+
+        // Самой длинной должна оказаться строка с табами, хотя символов в ней меньше.
+        let text = "1234567890\n\t\t\tx";
+        let ranges = line_ranges(text);
+        assert_eq!(max_line_columns(text, &ranges), 13);
+    }
+
+    #[test]
+    fn max_line_columns_counts_characters_not_bytes() {
+        // Кириллица в UTF-8 занимает два байта — колонка вышла бы вдвое шире.
+        let text = "привет";
+        let ranges = line_ranges(text);
+        assert_eq!(max_line_columns(text, &ranges), 6);
     }
 
     #[test]

@@ -49,6 +49,12 @@ pub enum Icon {
     Moon,
     /// Расходящиеся волны — «Следить за файлом».
     Waves,
+    /// Боковая панель — «Оглавление».
+    Sidebar,
+    /// Крестик — «Закрыть».
+    Close,
+    /// Лупа — «Поиск».
+    Search,
 }
 
 impl Icon {
@@ -62,6 +68,9 @@ impl Icon {
             Self::Sun => "Sun",
             Self::Moon => "Moon",
             Self::Waves => "Waves",
+            Self::Sidebar => "Sidebar",
+            Self::Close => "Close",
+            Self::Search => "Search",
         }
     }
 
@@ -76,6 +85,9 @@ impl Icon {
         Self::Sun,
         Self::Moon,
         Self::Waves,
+        Self::Sidebar,
+        Self::Close,
+        Self::Search,
     ];
 }
 
@@ -281,6 +293,9 @@ fn draw(painter: &egui::Painter, rect: Rect, icon: Icon, color: egui::Color32) {
         Icon::Sun => sun(&pen),
         Icon::Moon => moon(&pen),
         Icon::Waves => waves(&pen),
+        Icon::Sidebar => sidebar(&pen),
+        Icon::Close => close(&pen),
+        Icon::Search => search(&pen),
     }
 }
 
@@ -406,6 +421,66 @@ fn waves(pen: &Pen<'_>) {
     }
 }
 
+/// Боковая панель: рамка, вертикальная перегородка и строчки списка справа.
+fn sidebar(pen: &Pen<'_>) {
+    pen.path(&[
+        (2.2, 3.0),
+        (13.8, 3.0),
+        (13.8, 13.0),
+        (2.2, 13.0),
+        (2.2, 3.0),
+    ]);
+    pen.path(&[(6.6, 3.0), (6.6, 13.0)]);
+    for y in [6.0, 8.0, 10.0] {
+        pen.path(&[(3.6, y), (5.6, y)]);
+    }
+}
+
+/// Крестик: две диагонали.
+///
+/// Рисуем, а не берём символ `✕` из шрифта, и на то есть причина.
+/// Символа U+2715 нет в Inter, и он доставался из последнего запасного
+/// шрифта цепочки — иконочного, где выглядел не крестиком. Кроме того,
+/// символ в тексте не масштабируется вместе с иконками и не подчиняется
+/// их толщине штриха: рядом с рисованными иконками он всегда чужой.
+fn close(pen: &Pen<'_>) {
+    pen.path(&[(4.6, 4.6), (11.4, 11.4)]);
+    pen.path(&[(11.4, 4.6), (4.6, 11.4)]);
+}
+
+/// Лупа: окружность и ручка по той же диагонали.
+fn search(pen: &Pen<'_>) {
+    pen.circle(6.8, 6.8, 4.0);
+    // Ручка начинается на самой окружности, иначе видно стык.
+    let edge = 6.8 + 4.0 / (2.0_f32).sqrt();
+    pen.path(&[(edge, edge), (13.6, 13.6)]);
+}
+
+// ---------------------------------------------------------------------------
+// Символы, подставляемые прямо в текст
+// ---------------------------------------------------------------------------
+
+/// Символы вне латиницы и кириллицы, которые интерфейс подставляет
+/// в текст, а не рисует иконкой.
+///
+/// Список ведётся руками, и это осознанно: автоматически собрать его
+/// из исходников нельзя, а цена ошибки — пустой квадрат вместо символа,
+/// который поштучно почти не заметишь. Раздел в галерее проверяет каждый
+/// символ на наличие глифа в обеих семьях шрифтов.
+///
+/// Если добавляете в интерфейс новый символ — впишите его сюда
+/// и посмотрите галерею. Если глифа нет, рисуйте иконку, как сделано
+/// с крестиком.
+pub const TEXT_SYMBOLS: &[(char, &str)] = &[
+    ('«', "кавычки в сообщениях"),
+    ('»', "кавычки в сообщениях"),
+    ('·', "разделитель в счётчике поиска"),
+    ('×', "подписи размеров в этой галерее"),
+    ('—', "тире в заголовке окна и текстах"),
+    ('…', "многоточие в «Открыть…»"),
+    ('−', "минус в таблице горячих клавиш"),
+];
+
 // ---------------------------------------------------------------------------
 // Отладочная галерея
 // ---------------------------------------------------------------------------
@@ -443,6 +518,16 @@ pub fn gallery(ctx: &egui::Context, open: &mut bool) {
                 });
                 ui.add_space(8.0);
             }
+
+            ui.separator();
+            ui.label(egui::RichText::new("Символы, подставляемые в текст").strong());
+            ui.label(
+                egui::RichText::new(
+                    "«НЕТ» означает пустой квадрат в интерфейсе: глифа нет                      ни в одном шрифте цепочки. Такой символ надо заменить иконкой.",
+                )
+                .weak(),
+            );
+            symbol_coverage(ui);
         });
 }
 
@@ -472,6 +557,52 @@ fn gallery_rows(ui: &mut egui::Ui) {
         ui.label("имена");
         for &icon in Icon::ALL {
             ui.label(egui::RichText::new(icon.name()).small().weak());
+        }
+    });
+}
+
+/// Проверка, что каждому символу из `TEXT_SYMBOLS` найдётся глиф.
+///
+/// `has_glyph` — публичный API egui, он спрашивает всю цепочку шрифтов
+/// семьи. Юнит-тестом это не сделать: нужен живой `Context` с уже
+/// загруженными шрифтами, — поэтому проверка отладочная. Но настоящая:
+/// «нет» здесь означает пустой квадрат в интерфейсе.
+fn symbol_coverage(ui: &mut egui::Ui) {
+    // Цвет берём заранее: замыкание ниже иначе одолжило бы `ui`
+    // неизменяемо, а он тут же нужен изменяемо.
+    let missing_color = ui.visuals().error_fg_color;
+    // Слова, а не значки: значок «галочка» сам может оказаться
+    // непокрытым, и тогда отчёт соврёт о самом себе.
+    let verdict = move |found: bool| {
+        if found {
+            egui::RichText::new("есть").weak()
+        } else {
+            egui::RichText::new("НЕТ").color(missing_color)
+        }
+    };
+
+    egui::Grid::new("symbols").num_columns(4).show(ui, |ui| {
+        ui.label(egui::RichText::new("символ").strong());
+        ui.label(egui::RichText::new("Inter").strong());
+        ui.label(egui::RichText::new("JetBrains Mono").strong());
+        ui.label(egui::RichText::new("где используется").strong());
+        ui.end_row();
+
+        for &(symbol, usage) in TEXT_SYMBOLS {
+            let proportional = egui::TextStyle::Body.resolve(ui.style());
+            let monospace = egui::TextStyle::Monospace.resolve(ui.style());
+            let (in_body, in_mono) = ui.ctx().fonts_mut(|fonts| {
+                (
+                    fonts.has_glyph(&proportional, symbol),
+                    fonts.has_glyph(&monospace, symbol),
+                )
+            });
+
+            ui.label(format!("{symbol}  U+{:04X}", symbol as u32));
+            ui.label(verdict(in_body));
+            ui.label(verdict(in_mono));
+            ui.label(egui::RichText::new(usage).weak());
+            ui.end_row();
         }
     });
 }
