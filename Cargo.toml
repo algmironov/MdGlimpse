@@ -1,0 +1,38 @@
+[package]
+name = "mdview"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Минималистичный просмотрщик Markdown: рендер + исходник по одной кнопке"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Оконный каркас + сам GUI. eframe тянет egui как свою зависимость,
+# поэтому отдельно egui объявлять не нужно — берём его через eframe::egui.
+eframe = "0.36"
+
+# Загрузчики картинок: "image" — декодеры, "file" — поддержка file:// URI,
+# без которой не покажутся картинки, лежащие рядом с .md файлом.
+egui_extras = { version = "0.36", features = ["image", "file"] }
+
+# Собственно рендер Markdown в виджеты egui.
+# better_syntax_highlighting = подсветка кода в блоках ``` через syntect.
+egui_commonmark = { version = "0.25", features = ["better_syntax_highlighting"] }
+
+# Декодеры форматов для картинок. Убирайте лишнее — уменьшится бинарник.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+] }
+
+# Нативный диалог "открыть файл".
+rfd = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
