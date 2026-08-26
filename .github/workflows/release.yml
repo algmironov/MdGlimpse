@@ -1,0 +1,322 @@
+# Сборка и публикация релиза по тегу вида v1.2.3.
+#
+# Результат — ЧЕРНОВИК релиза: файлы приложены, описание составлено,
+# но никому, кроме тех, у кого есть доступ на запись, он не виден.
+# Опубликовать — отдельное действие руками, и это намеренно: последний
+# взгляд на то, что уходит людям, дешевле любого отката.
+name: Release
+
+on:
+  push:
+    tags:
+      # Только сам тег. Отдельного фильтра по ветке нет: тег и так ставят
+      # на конкретный коммит, и проверять, в какой он ветке, незачем.
+      - "v*"
+
+  # Отладочный прогон без настоящего релиза. Нужен, чтобы проверить сам
+  # workflow: собрать установщик, посчитать суммы, посмотреть на описание —
+  # и ничего при этом не опубликовать.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия для прогона, без v (например 0.1.0). Обязана совпадать с Cargo.toml."
+        required: true
+        type: string
+      publish:
+        description: "Создать черновик релиза. Выключено — только собрать и приложить файлы к прогону."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Отмены нет: релизная сборка не должна оборваться на середине
+  # из-за случайного второго запуска.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Заслон. Считанные секунды, ничего не собирает — и именно поэтому стоит
+  # первым: узнать про расхождение версий через двадцать минут сборки
+  # заметно обиднее, чем через двадцать секунд.
+  # ---------------------------------------------------------------------
+  guard:
+    name: Версия
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Тег и Cargo.toml говорят одно и то же
+        id: resolve
+        env:
+          # Через env, а не подстановкой ${{ }} прямо в тело скрипта:
+          # значение приходит из ввода пользователя, а подстановка
+          # склеивается с текстом скрипта ДО запуска bash.
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            publish="$INPUT_PUBLISH"
+            echo "Отладочный прогон. Публикация черновика: ${publish}"
+          else
+            # github.ref_name для тега — это сам тег, без refs/tags/.
+            version="${REF_NAME#v}"
+            publish=true
+          fi
+          tag="v${version}"
+
+          # Источник правды — cargo, а не grep по файлу: в Cargo.toml
+          # ключ version встречается ещё и в таблицах зависимостей,
+          # и однажды регулярка возьмёт не ту строку.
+          cargo_version="$(cargo metadata --no-deps --offline --format-version 1 | jq -r '.packages[0].version')"
+
+          echo "тег:        ${tag}"
+          echo "Cargo.toml: ${cargo_version}"
+
+          if [ "${version}" != "${cargo_version}" ]; then
+            echo "::error::Тег ${tag} не соответствует версии ${cargo_version} в Cargo.toml."
+            echo "::error::Номер версии попадает в метаданные .exe, в имя установщика и в «Установка и удаление программ»."
+            echo "::error::Поднимите version в Cargo.toml, закоммитьте, переставьте тег."
+            exit 1
+          fi
+
+          # Заодно ловим версию, которую Inno Setup не сможет записать
+          # в VersionInfo: там формат строго числовой, X.Y.Z[.W].
+          if ! printf '%s' "${version}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Версия ${version} не в формате X.Y.Z."
+            echo "::error::Суффикс вида -rc1 установщик в VersionInfo записать не сможет."
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### Версия ${version}: тег и Cargo.toml совпадают" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Windows: голый бинарник + установщик Inno Setup.
+  # ---------------------------------------------------------------------
+  windows:
+    name: Windows
+    needs: guard
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кеш сборки
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      # На образе windows-2025 Inno Setup сегодня есть (6.7.1), но состав
+      # образа — не наш контракт: он менялся раньше и поменяется снова.
+      # Ставим явно и остаёмся на windows-latest. Альтернатива — прибить
+      # runs-on: windows-2022, где Inno тоже есть, — отложила бы ту же
+      # проблему до дня, когда 2022 выведут из обращения, и до тех пор
+      # релиз собирался бы на устаревающем образе.
+      # Пакет уже установлен — choco сообщает об этом и выходит успешно.
+      - name: Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Сборка установщика
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          # Куда именно ляжет Inno, зависит от того, кто его поставил:
+          # choco и штатный установщик кладут машинно, в Program Files (x86),
+          # winget умеет и в профиль пользователя. Перебираем, а не
+          # угадываем.
+          $iscc = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $iscc) {
+            $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $iscc) { throw "ISCC.exe не найден — Inno Setup не установился" }
+          Write-Host "ISCC: $iscc"
+
+          # /F переопределяет OutputBaseFilename. Без него имя пришло бы
+          # из GetVersionNumbersString, то есть в четырёх числах —
+          # mdglimpse-1.0.0.0-setup.exe, — и разошлось бы с тегом.
+          # Сам .iss при этом не трогаем: версию ВНУТРИ установщика он
+          # по-прежнему берёт из метаданных .exe, то есть из Cargo.toml.
+          & $iscc "/Fmdglimpse-$env:VERSION-setup" installer\mdglimpse.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc завершился с кодом $LASTEXITCODE" }
+
+      - name: Контрольные суммы
+        shell: bash
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          cp "installer/output/mdglimpse-${VERSION}-setup.exe" dist/
+          # Голый .exe кладём с версией в имени: в папке «Загрузки»
+          # рядом с чужими файлами просто «mdglimpse.exe» ничего не говорит.
+          cp target/release/mdglimpse.exe "dist/mdglimpse-${VERSION}-windows-x64.exe"
+
+          cd dist
+          # Формат sha256sum: «сумма␣␣имя». Так его примет и sha256sum -c,
+          # и человек глазами. sed убирает ./ из имён.
+          sha256sum ./*.exe | sed 's| \./| |' > windows.sha256
+          cat windows.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Linux: бинарник в .tar.gz.
+  # ---------------------------------------------------------------------
+  linux:
+    name: Linux
+    needs: guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Тот же список, что в ci.yml и в README. Меняется — меняется в трёх
+      # местах сразу, иначе релиз соберётся не тем, что проверял CI.
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxkbcommon-dev libwayland-dev
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кеш сборки
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Упаковка и контрольные суммы
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist "mdglimpse-${VERSION}"
+
+          # Архив разворачивается в свой каталог, а не россыпью в текущий:
+          # человек распаковывает файл в ~/Downloads, и вываливать туда
+          # два файла без папки невежливо.
+          cp target/release/mdglimpse "mdglimpse-${VERSION}/"
+          cp README.md "mdglimpse-${VERSION}/"
+          tar -czf "dist/mdglimpse-${VERSION}-linux-x64.tar.gz" "mdglimpse-${VERSION}"
+
+          cd dist
+          sha256sum ./*.tar.gz | sed 's| \./| |' > linux.sha256
+          cat linux.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Черновик релиза.
+  # ---------------------------------------------------------------------
+  release:
+    name: Черновик релиза
+    needs: [guard, windows, linux]
+    if: needs.guard.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+
+    # Единственное место во всём файле, где нужен токен с правом записи.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # v8 у download-artifact против v7 у upload-artifact — не опечатка:
+      # это разные репозитории со своей нумерацией, и старших мажоров
+      # у них сейчас именно столько.
+      - uses: actions/download-artifact@v8
+        with:
+          path: incoming
+
+      - name: Описание релиза и общий файл сумм
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Артефакты приезжают в incoming/<имя артефакта>/. Раскладку
+          # не закладываем: ищем find'ом, а не глобом с фиксированной
+          # глубиной — иначе смена версии download-artifact однажды
+          # молча оставит SHA256SUMS.txt пустым.
+          find incoming -type f ! -name '*.sha256' -exec cp {} dist/ \;
+          find incoming -type f -name '*.sha256' -exec cat {} + | sort -k2 > dist/SHA256SUMS.txt
+
+          if [ ! -s dist/SHA256SUMS.txt ]; then
+            echo "::error::Контрольные суммы не собрались — артефакты приехали не туда."
+            exit 1
+          fi
+
+          echo "Что уходит в релиз:"
+          ls -lh dist
+
+          # Текст описания лежит отдельным файлом: правка формулировки
+          # не должна требовать лезть в логику workflow.
+          # `r` дописывает суммы после строки-заполнителя, `d` убирает
+          # саму строку. Порядок важен: d выполняется вторым.
+          sed -e "s/{{VERSION}}/${VERSION}/g" \
+              -e "/{{CHECKSUMS}}/r dist/SHA256SUMS.txt" \
+              -e "/{{CHECKSUMS}}/d" \
+              .github/release-notes-template.md > release-body.md
+
+          cat release-body.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Черновик релиза
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.guard.outputs.tag }}
+          name: MdGlimpse ${{ needs.guard.outputs.version }}
+          body_path: release-body.md
+          # Главная строка файла. Релиз создаётся невидимым для всех, кроме
+          # тех, у кого есть доступ на запись; кнопку «Publish release»
+          # нажимает человек, посмотрев на то, что получилось.
+          draft: true
+          files: dist/*
+          fail_on_unmatched_files: true
