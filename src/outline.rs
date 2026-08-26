@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn cyrillic_slug_matches_convention() {
         assert_eq!(
-            slug("Проверочный документ mdview"),
-            "проверочный-документ-mdview"
+            slug("Проверочный документ MdGlimpse"),
+            "проверочный-документ-mdglimpse"
         );
         assert_eq!(
             slug("Кириллица в разных начертаниях"),

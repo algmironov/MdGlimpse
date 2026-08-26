@@ -13,8 +13,10 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::document::{self, Document};
 use crate::icons::{self, Icon, Segment};
+use crate::platform;
 use crate::rendered_probe::{self, ProbeBroken};
 use crate::search;
+use crate::settings::{self, Settings};
 use std::ops::Range;
 
 /// Ширина колонки текста. Длинные строки на весь монитор читать невозможно.
@@ -43,19 +45,6 @@ const COPY_SHORTCUT_HINT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::C);
 const OUTLINE_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B);
-
-/// Ключ в хранилище eframe.
-///
-/// Значение кладём строкой через `Storage::set_string`, а не структурой
-/// с serde-производными: поле пока одно. Когда на Этапе 2 их станет
-/// десяток, отдельная структура настроек окупится, сейчас — нет.
-///
-/// Ширины панели здесь нет намеренно: её сохраняет и восстанавливает сама
-/// egui — при включённой фиче persistence геометрия панелей уезжает
-/// в то же хранилище. Свой ключ на неё заводить бессмысленно, он всё равно
-/// проигрывал бы состоянию egui при загрузке. Проверено: правка сохранённой
-/// egui-геометрии меняет ширину панели при следующем запуске.
-const KEY_OUTLINE_OPEN: &str = "outline_open";
 
 const OUTLINE_DEFAULT_WIDTH: f32 = 240.0;
 
@@ -244,6 +233,10 @@ struct Actions {
     gallery: bool,
     /// Свернуть/развернуть боковую панель с оглавлением.
     toggle_outline: bool,
+    /// Открыть файл из списка недавних по его номеру.
+    open_recent: Option<usize>,
+    /// Очистить список недавних.
+    clear_recent: bool,
     /// Открыть поиск и поставить в него фокус.
     find: bool,
     /// Закрыть поиск.
@@ -262,6 +255,10 @@ struct Actions {
     about: bool,
     /// Открыть окно «Горячие клавиши».
     shortcuts: bool,
+    /// Зарегистрировать себя обработчиком .md.
+    associate: bool,
+    /// Убрать регистрацию.
+    unassociate: bool,
 }
 
 /// Что делаем с масштабом. Отдельный enum, а не число: «сбросить» —
@@ -273,7 +270,7 @@ enum Zoom {
     Reset,
 }
 
-pub struct MdViewApp {
+pub struct MdGlimpseApp {
     /// `Option`, потому что приложение может быть запущено без файла.
     /// Никакого null: чтобы добраться до Document, придётся разобрать Option.
     document: Option<Document>,
@@ -299,6 +296,12 @@ pub struct MdViewApp {
     gallery_open: bool,
     /// Открыто ли окно «О программе».
     about_open: bool,
+    /// Зарегистрированы ли мы обработчиком .md.
+    ///
+    /// Кэш, а не запрос на каждый кадр: меню перерисовывается непрерывно,
+    /// а лезть в реестр по шестьдесят раз в секунду незачем. Значение
+    /// обновляется при запуске и после каждой попытки что-то изменить.
+    association: platform::Association,
     /// Открыто ли окно «Горячие клавиши».
     shortcuts_open: bool,
     /// Развёрнута ли боковая панель с оглавлением.
@@ -310,16 +313,23 @@ pub struct MdViewApp {
     first_visible_line: usize,
     /// Поиск по документу.
     search: Search,
+    /// То, что переживает перезапуск.
+    settings: Settings,
 }
 
-impl MdViewApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+impl MdGlimpseApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, requested: &[PathBuf]) -> Self {
         // Хранилище есть только при включённой фиче persistence и только
         // если eframe сумел его открыть, поэтому всюду значения по умолчанию.
-        let stored = |key: &str| cc.storage.and_then(|storage| storage.get_string(key));
-        let outline_open = stored(KEY_OUTLINE_OPEN)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(true);
+        // Хранилище есть только при включённой фиче persistence и только
+        // если eframe сумел его открыть, поэтому всюду значения по умолчанию.
+        let mut settings: Settings = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, settings::STORAGE_KEY))
+            .unwrap_or_default();
+        // Исчезнувшие файлы из «Недавних» вычищаем при загрузке, а не при
+        // показе меню: иначе список молча врал бы до первого клика.
+        settings.prune(|path| path.exists());
 
         // Без этого картинки в markdown не отрисуются вообще.
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -333,24 +343,43 @@ impl MdViewApp {
         let mut app = Self {
             document: None,
             error: None,
-            mode: ViewMode::Rendered,
+            mode: if settings.source_mode {
+                ViewMode::Source
+            } else {
+                ViewMode::Rendered
+            },
             cache: CommonMarkCache::default(),
-            auto_reload: true,
+            auto_reload: settings.auto_reload,
             last_check: Instant::now(),
             shown_title: String::new(),
             select_all: false,
             notice: None,
             gallery_open: false,
             about_open: false,
+            association: platform::state(),
             shortcuts_open: false,
-            outline_open,
+            outline_open: settings.outline_open,
             pending_scroll_line: None,
             first_visible_line: 0,
             search: Search::default(),
+            settings,
         };
 
-        if let Some(path) = initial {
-            app.open_path(path);
+        // Открываем первый файл; про остальные говорим прямо, а не молчим.
+        if let Some((first, rest)) = requested.split_first() {
+            app.open_path(first.clone());
+            if !rest.is_empty() {
+                app.notice = Some((
+                    format!(
+                        "Открыт только «{}». Ещё {} {} осталось неоткрытым: \
+                         вкладок в MdGlimpse пока нет, откройте их по одному.",
+                        document::file_name(first),
+                        rest.len(),
+                        plural(rest.len(), "файл", "файла", "файлов"),
+                    ),
+                    Instant::now(),
+                ));
+            }
         }
 
         app
@@ -371,6 +400,7 @@ impl MdViewApp {
                 self.error = None;
                 self.select_all = false;
                 self.search.invalidate();
+                self.settings.remember(&path);
                 self.document = Some(document);
             }
             Err(err) => {
@@ -402,6 +432,8 @@ impl MdViewApp {
             auto_reload,
             outline_open,
             search,
+            settings,
+            association,
             ..
         } = self;
         let search_open = search.open;
@@ -415,10 +447,14 @@ impl MdViewApp {
             menu_bar(
                 ui,
                 &mut actions,
-                has_document,
-                *mode,
-                *auto_reload,
-                *outline_open,
+                MenuState {
+                    has_document,
+                    mode: *mode,
+                    watching: *auto_reload,
+                    outline_open: *outline_open,
+                    recent: &settings.recent,
+                    association: *association,
+                },
             );
             ui.separator();
 
@@ -664,6 +700,37 @@ impl MdViewApp {
     /// Копируем из `Document`, а не из нарисованного: на экране в любой
     /// момент есть только видимые строки, и «скопировать всё» через них
     /// было бы враньём.
+    /// Регистрирует или снимает регистрацию обработчика .md.
+    ///
+    /// Единственное место во всей программе, которое пишет за её пределы,
+    /// и вызывается оно только из меню — то есть по явному действию
+    /// человека. При запуске в систему ничего не пишется.
+    fn change_association(&mut self, register: bool) {
+        let outcome = if register {
+            platform::register()
+        } else {
+            platform::unregister()
+        };
+
+        // Состояние перечитываем в любом случае: регистрация могла
+        // упасть на полпути, и показывать после этого прежний ответ
+        // значило бы врать.
+        self.association = platform::state();
+
+        let message = match (outcome, register) {
+            (Ok(()), true) => format!(
+                "MdGlimpse зарегистрирован для {}. Чтобы открывать их двойным \
+                 щелчком, выберите MdGlimpse в «Открыть с помощью» и отметьте \
+                 «Всегда использовать»: сделать это за вас программа не может — \
+                 Windows оставляет выбор за человеком.",
+                extension_list()
+            ),
+            (Ok(()), false) => format!("Регистрация для {} снята.", extension_list()),
+            (Err(error), _) => format!("Не получилось: {error}"),
+        };
+        self.notice = Some((message, Instant::now()));
+    }
+
     fn copy_everything(&mut self, ctx: &egui::Context) {
         let Some(document) = self.document.as_ref() else {
             return;
@@ -883,8 +950,8 @@ impl MdViewApp {
 
     fn sync_window_title(&mut self, ctx: &egui::Context) {
         let title = match self.document.as_ref() {
-            Some(document) => format!("{} — mdview", document.title()),
-            None => "mdview".to_owned(),
+            Some(document) => format!("{} — MdGlimpse", document.title()),
+            None => "MdGlimpse".to_owned(),
         };
 
         if title != self.shown_title {
@@ -959,19 +1026,50 @@ fn install_fonts(ctx: &egui::Context) {
     ));
 }
 
+/// Расширения списком через запятую: «.md и .markdown».
+///
+/// Собирается из той же константы, что и регистрация, — разойтись
+/// подписи и поведению негде.
+fn extension_list() -> String {
+    let names: Vec<String> = platform::EXTENSIONS
+        .iter()
+        .map(|extension| format!(".{extension}"))
+        .collect();
+    match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} и {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// Окно «О программе».
-fn about_window(ctx: &egui::Context, open: &mut bool) {
+fn about_window(ctx: &egui::Context, open: &mut bool, association: platform::Association) {
     egui::Window::new("О программе")
         .open(open)
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
-            ui.heading("mdview");
+            ui.heading("MdGlimpse");
             ui.label(format!("Версия {}", env!("CARGO_PKG_VERSION")));
             ui.add_space(6.0);
             ui.label(env!("CARGO_PKG_DESCRIPTION"));
             ui.add_space(6.0);
             ui.label("Просмотрщик, а не редактор: сохранения и правки текста нет и не будет.");
+            ui.add_space(6.0);
+
+            ui.label(format!(
+                "Файлы {}: {}",
+                extension_list(),
+                association.label()
+            ));
+
+            // Ссылка появляется, только если поле repository заполнено
+            // в Cargo.toml. Пустая строка — не адрес, и подсовывать
+            // выдуманный лучше не надо.
+            let repository = env!("CARGO_PKG_REPOSITORY");
+            if !repository.is_empty() {
+                ui.hyperlink(repository);
+            }
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(concat!(
@@ -1147,6 +1245,21 @@ fn current_heading(headings: &[crate::outline::Heading], line: usize) -> Option<
     after.checked_sub(1)
 }
 
+/// Снимок состояния, от которого зависят подписи и галочки в меню.
+///
+/// Появился не для красоты: аргументов у `menu_bar` стало восемь, и это
+/// та граница, за которой список параметров перестаёт читаться. Структура
+/// с именованными полями называет каждое значение в месте вызова.
+struct MenuState<'a> {
+    has_document: bool,
+    mode: ViewMode,
+    /// Включено ли слежение за файлом.
+    watching: bool,
+    outline_open: bool,
+    recent: &'a [PathBuf],
+    association: platform::Association,
+}
+
 /// Строка меню: Файл, Правка, Вид, Справка.
 ///
 /// Нативного меню Windows тут нет и быть не может: egui рисует интерфейс
@@ -1155,14 +1268,15 @@ fn current_heading(headings: &[crate::outline::Heading], line: usize) -> Option<
 ///
 /// Меню осталось единственным местом, где действия названы словами:
 /// тулбар теперь целиком на иконках.
-fn menu_bar(
-    ui: &mut egui::Ui,
-    actions: &mut Actions,
-    has_document: bool,
-    mode: ViewMode,
-    watching: bool,
-    outline_open: bool,
-) {
+fn menu_bar(ui: &mut egui::Ui, actions: &mut Actions, state: MenuState<'_>) {
+    let MenuState {
+        has_document,
+        mode,
+        watching,
+        outline_open,
+        recent,
+        association,
+    } = state;
     let ctx = ui.ctx().clone();
     // Пункт с подписью сочетания справа — как принято в настольных
     // приложениях. Сочетание берётся из той же константы, что и обработчик.
@@ -1182,9 +1296,28 @@ fn menu_bar(
             }
 
             ui.menu_button("Недавние", |ui| {
-                // Задел на Этап 2: список недавних файлов появится вместе
-                // с сохранением состояния между запусками.
-                ui.add_enabled(false, egui::Button::new("пока пусто"));
+                if recent.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("пока пусто"));
+                    return;
+                }
+                for (index, path) in recent.iter().enumerate() {
+                    // В пункте — имя файла, полный путь в подсказке:
+                    // пути бывают длиннее любого разумного меню.
+                    let label = crate::document::file_name(path);
+                    if ui
+                        .button(label)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        actions.open_recent = Some(index);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Очистить список").clicked() {
+                    actions.clear_recent = true;
+                    ui.close();
+                }
             });
 
             if ui
@@ -1193,6 +1326,38 @@ fn menu_bar(
             {
                 actions.reload = true;
                 ui.close();
+            }
+
+            ui.separator();
+
+            // Ассоциация — действие с побочным эффектом вне программы,
+            // поэтому пункт один и он же показывает текущее состояние:
+            // человек должен видеть, что именно произойдёт по нажатию.
+            match association {
+                platform::Association::Registered => {
+                    if ui
+                        .add(item("Убрать из «Открыть с помощью»", None))
+                        .clicked()
+                    {
+                        actions.unassociate = true;
+                        ui.close();
+                    }
+                }
+                platform::Association::Unsupported => {
+                    ui.add_enabled(false, egui::Button::new("Добавить в «Открыть с помощью»"))
+                        .on_disabled_hover_text("На этой системе не поддерживается");
+                }
+                // Stale — записи есть, но ведут на другую копию программы.
+                // Лечится тем же действием, что и полное отсутствие.
+                platform::Association::Missing | platform::Association::Stale => {
+                    if ui
+                        .add(item("Добавить в «Открыть с помощью»", None))
+                        .clicked()
+                    {
+                        actions.associate = true;
+                        ui.close();
+                    }
+                }
             }
 
             ui.separator();
@@ -1604,13 +1769,21 @@ fn draw_placeholder(ui: &mut egui::Ui) {
     });
 }
 
-impl eframe::App for MdViewApp {
+impl eframe::App for MdGlimpseApp {
     /// В 0.36 у трейта `App` нет `update(&mut self, ctx, frame)`: приложение
     /// получает корневой `Ui` без полей и фона, а панели прикрепляются к нему.
     /// Сохранение состояния между запусками. Вызывается eframe при выходе
     /// и раз в тридцать секунд.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(KEY_OUTLINE_OPEN, self.outline_open.to_string());
+        self.settings.outline_open = self.outline_open;
+        self.settings.source_mode = self.mode == ViewMode::Source;
+        self.settings.auto_reload = self.auto_reload;
+        eframe::set_value(storage, settings::STORAGE_KEY, &self.settings);
+
+        // Ключи прежних версий. Хранилище их само не удаляет.
+        for key in settings::DEAD_KEYS {
+            storage.remove_string(key);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1710,7 +1883,11 @@ impl eframe::App for MdViewApp {
         actions.zoom = actions.zoom.or(from_toolbar.zoom);
         actions.about |= from_toolbar.about;
         actions.shortcuts |= from_toolbar.shortcuts;
+        actions.associate |= from_toolbar.associate;
+        actions.unassociate |= from_toolbar.unassociate;
         actions.toggle_outline |= from_toolbar.toggle_outline;
+        actions.open_recent = actions.open_recent.or(from_toolbar.open_recent);
+        actions.clear_recent |= from_toolbar.clear_recent;
         actions.find |= from_toolbar.find;
         actions.close_find |= from_toolbar.close_find;
         actions.step_match = actions.step_match.or(from_toolbar.step_match);
@@ -1718,6 +1895,20 @@ impl eframe::App for MdViewApp {
         // 4. Выполняем — теперь `self` снова свободен целиком.
         if actions.open {
             self.open_dialog();
+        }
+        if let Some(index) = actions.open_recent {
+            if let Some(path) = self.settings.recent.get(index).cloned() {
+                self.open_path(path);
+            }
+        }
+        if actions.clear_recent {
+            self.settings.recent.clear();
+        }
+        if actions.associate {
+            self.change_association(true);
+        }
+        if actions.unassociate {
+            self.change_association(false);
         }
         if actions.toggle {
             self.mode = self.mode.flipped();
@@ -1814,7 +2005,7 @@ impl eframe::App for MdViewApp {
             icons::gallery(&ctx, &mut self.gallery_open);
         }
         if self.about_open {
-            about_window(&ctx, &mut self.about_open);
+            about_window(&ctx, &mut self.about_open, self.association);
         }
         if self.shortcuts_open {
             shortcuts_window(&ctx, &mut self.shortcuts_open);

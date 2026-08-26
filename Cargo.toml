@@ -1,10 +1,18 @@
 [package]
-name = "mdview"
+# Имя пакета задаёт и имя бинарника: target/release/mdglimpse.exe.
+# Строчными буквами — так принято в crates.io и так его увидит cargo;
+# отображаемое имя «MdGlimpse» живёт отдельно, в интерфейсе и метаданных.
+name = "mdglimpse"
 version = "0.1.0"
+authors = ["algmironov"]
 edition = "2021"
 rust-version = "1.95"
 description = "Минималистичный просмотрщик Markdown: рендер + исходник по одной кнопке"
 license = "MIT OR Apache-2.0"
+# repository пока не заполнен: проект ещё не выложен и адрес выдумывать
+# нельзя. Окно «О программе» показывает ссылку, только если поле есть, —
+# впишите сюда настоящий URL, и она появится сама.
+repository = "https://github.com/algmironov/MdGlimpse"
 
 [dependencies]
 # Оконный каркас + сам GUI. eframe тянет egui как свою зависимость,
@@ -36,8 +44,38 @@ image = { version = "0.25", default-features = false, features = [
 # Отключаем всё лишнее: нужен только парсер, а не HTML-рендерер и getopts.
 pulldown-cmark = { version = "0.13", default-features = false }
 
+# Сериализация настроек. Уже в дереве — её тянет фича persistence
+# у eframe; объявлена явно, потому что мы её используем напрямую.
+serde = { version = "1", features = ["derive"] }
+
 # Нативный диалог "открыть файл".
 rfd = "0.17"
+
+# Реестр и оповещение оболочки — для регистрации .md за просмотрщиком.
+# Крейт уже в дереве: его тянет rfd. Объявлен явно, потому что мы зовём
+# его напрямую; перечисленные фичи объединяются с теми, что просит rfd,
+# так что новых зависимостей не прибавляется.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    # Win32_Security нужен не ради безопасности, а потому что за этой фичей
+    # в крейте спрятан RegCreateKeyExW: в его сигнатуре есть указатель
+    # на SECURITY_ATTRIBUTES, и без фичи функции просто нет.
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+] }
+
+# Встраивание иконки и метаданных в .exe. Только на время сборки:
+# в бинарник крейт не попадает, в дереве зависимостей приложения его нет.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+# Только для тестов: тем же ron eframe пишет настройки в хранилище,
+# и тест проверяет, что неполная или устаревшая запись переживёт чтение.
+# В release-сборку не попадает; в дереве уже есть через eframe/persistence.
+ron = "0.12"
 
 [profile.release]
 opt-level = 3

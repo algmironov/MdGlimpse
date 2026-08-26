@@ -577,7 +577,7 @@ mod tests {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("mdview-test-{}-{tag}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("mdglimpse-test-{}-{tag}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("создать временный каталог");
         dir
     }
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn non_markdown_extension_is_detected() {
-        let document = load_bytes("toml", "Cargo.toml", b"[package]\nname = \"mdview\"\n")
+        let document = load_bytes("toml", "Cargo.toml", b"[package]\nname = \"mdglimpse\"\n")
             .expect("toml — это текст, открывать можно");
 
         assert!(
