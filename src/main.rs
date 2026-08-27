@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod diag; // DIAG-DND-TEMP: временный модуль, удалить вместе с src/diag.rs
 mod document;
 mod icons;
 mod outline;

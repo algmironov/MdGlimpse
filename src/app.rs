@@ -319,6 +319,9 @@ pub struct MdGlimpseApp {
 
 impl MdGlimpseApp {
     pub fn new(cc: &eframe::CreationContext<'_>, requested: &[PathBuf]) -> Self {
+        // DIAG-DND-TEMP: удалить вместе с src/diag.rs.
+        crate::diag::startup(cc);
+
         // Хранилище есть только при включённой фиче persistence и только
         // если eframe сумел его открыть, поэтому всюду значения по умолчанию.
         // Хранилище есть только при включённой фиче persistence и только
@@ -1851,6 +1854,9 @@ impl eframe::App for MdGlimpseApp {
                 ..Actions::default()
             }
         });
+
+        // DIAG-DND-TEMP: удалить вместе с src/diag.rs.
+        crate::diag::drag_and_drop(&ctx);
 
         // 2. Drag & drop. Клонируем пути, чтобы не держать блокировку ввода
         //    во время открытия файла.
