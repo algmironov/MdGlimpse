@@ -3,7 +3,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod diag; // DIAG-DND-TEMP: временный модуль, удалить вместе с src/diag.rs
 mod document;
 mod icons;
 mod outline;
@@ -25,6 +24,13 @@ fn main() -> eframe::Result<()> {
         .with_title("MdGlimpse")
         .with_inner_size([1000.0, 720.0])
         .with_min_inner_size([420.0, 320.0])
+        // Настройка только для Windows, хотя по имени этого не скажешь:
+        // egui-winit применяет её под `cfg(target_os = "windows")`, а нужна
+        // она там из-за COM — winit регистрирует OLE-приёмник перетаскивания.
+        // На X11 и Wayland строка молча отбрасывается, и включить или
+        // выключить перетаскивание ею нельзя. Если под Linux drag & drop
+        // не работает, искать причину надо не здесь: см. README, раздел
+        // про Wayland.
         .with_drag_and_drop(true);
     // Иконка заголовка, панели задач и Alt+Tab. Это не та же иконка, что
     // видна у .exe в проводнике: ту встраивает build.rs ресурсом, а эту
