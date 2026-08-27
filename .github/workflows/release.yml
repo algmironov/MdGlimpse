@@ -241,9 +241,29 @@ jobs:
 
           # Архив разворачивается в свой каталог, а не россыпью в текущий:
           # человек распаковывает файл в ~/Downloads, и вываливать туда
-          # два файла без папки невежливо.
+          # горсть файлов без папки невежливо.
           cp target/release/mdglimpse "mdglimpse-${VERSION}/"
-          cp README.md "mdglimpse-${VERSION}/"
+          cp README.md THIRD-PARTY.md THIRD-PARTY-CRATES.md "mdglimpse-${VERSION}/"
+
+          # Те же лицензии, что кладёт установщик под Windows, и той же
+          # раскладкой. Обязательства OFL и UFL не знают, из какого архива
+          # распакована программа: шрифты вшиты в бинарник одинаково,
+          # значит и уведомления обязаны ехать одинаково.
+          mkdir -p "mdglimpse-${VERSION}/licenses/fonts"
+          cp LICENSE-MIT "mdglimpse-${VERSION}/licenses/LICENSE-MIT.txt"
+          cp LICENSE-APACHE "mdglimpse-${VERSION}/licenses/LICENSE-APACHE.txt"
+          cp assets/fonts/Inter-OFL.txt \
+             assets/fonts/JetBrainsMono-OFL.txt \
+             "mdglimpse-${VERSION}/licenses/fonts/"
+          cp assets/fonts/epaint_default_fonts/UFL.txt \
+             "mdglimpse-${VERSION}/licenses/fonts/Ubuntu-UFL.txt"
+          cp assets/fonts/epaint_default_fonts/OFL.txt \
+             "mdglimpse-${VERSION}/licenses/fonts/NotoEmoji-OFL.txt"
+          cp assets/fonts/epaint_default_fonts/Hack-Regular.txt \
+             "mdglimpse-${VERSION}/licenses/fonts/Hack-LICENSE.txt"
+          cp assets/fonts/epaint_default_fonts/emoji-icon-font-mit-license.txt \
+             "mdglimpse-${VERSION}/licenses/fonts/emoji-icon-font-MIT.txt"
+
           tar -czf "dist/mdglimpse-${VERSION}-linux-x64.tar.gz" "mdglimpse-${VERSION}"
 
           cd dist

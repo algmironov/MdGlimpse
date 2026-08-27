@@ -1063,20 +1063,32 @@ fn about_window(ctx: &egui::Context, open: &mut bool, association: platform::Ass
                 association.label()
             ));
 
-            // Ссылка появляется, только если поле repository заполнено
-            // в Cargo.toml. Пустая строка — не адрес, и подсовывать
-            // выдуманный лучше не надо.
+            // Проверка на пустоту осталась не «на всякий случай»: поле
+            // repository необязательное, и если его однажды уберут,
+            // ui.hyperlink нарисует пустую кликабельную строку в никуда.
             let repository = env!("CARGO_PKG_REPOSITORY");
             if !repository.is_empty() {
                 ui.hyperlink(repository);
             }
             ui.add_space(6.0);
+
+            ui.label(egui::RichText::new(concat!("Лицензия: ", env!("CARGO_PKG_LICENSE"))).weak());
+            // Шесть, а не два: install_fonts добавляет наши шрифты через
+            // FontInsert поверх встроенных в egui, а не вместо них, —
+            // значит, раздаём мы все шесть, и умалчивать о четырёх нельзя.
+            // Перечислять их здесь по именам незачем: окно про программу,
+            // а не про лицензии. Кому надо — тому нужен файл, а не строка.
             ui.label(
-                egui::RichText::new(concat!(
-                    "Лицензия: ",
-                    env!("CARGO_PKG_LICENSE"),
-                    ". Шрифты Inter и JetBrains Mono — под OFL."
-                ))
+                egui::RichText::new(
+                    "Шесть встроенных шрифтов — под OFL 1.1, Ubuntu Font Licence 1.0 и MIT.",
+                )
+                .weak(),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Полный список шрифтов, зависимостей и их лицензий — \
+                     в THIRD-PARTY.md рядом с программой.",
+                )
                 .weak(),
             );
         });

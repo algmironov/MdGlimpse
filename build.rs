@@ -27,7 +27,10 @@ fn main() {
         resource.set("FileDescription", "Просмотрщик Markdown");
         resource.set("ProductName", "MdGlimpse");
         resource.set("CompanyName", "algmironov");
-        resource.set("LegalCopyright", "MIT OR Apache-2.0");
+        // LegalCopyright — поле для копирайта, а не для лицензии; раньше
+        // здесь стояло одно только «MIT OR Apache-2.0», то есть свойства
+        // .exe сообщали условия и умалчивали правообладателя.
+        resource.set("LegalCopyright", "© 2026 algmironov. MIT OR Apache-2.0");
 
         // Здесь expect уместен, хотя в самом приложении он запрещён:
         // молча выпустить .exe без иконки хуже, чем громко не собраться,

@@ -65,6 +65,41 @@ Name: "associate"; Description: "Добавить MdGlimpse в «Открыть 
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
+; Уведомления о том, что вшито в .exe. Оба — Markdown, и оба открываются
+; самой программой: отдельного ярлыка им не нужно.
+; THIRD-PARTY.md ведётся руками, THIRD-PARTY-CRATES.md генерирует
+; cargo-about. Если второго файла нет, iscc остановится вот на этой
+; строке — единственное напоминание перегенерировать список перед
+; релизом, которое невозможно пролистать.
+Source: "..\THIRD-PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-CRATES.md"; DestDir: "{app}"; Flags: ignoreversion
+
+; Собственная лицензия проекта — двойная, поэтому файла два. DestName
+; дописывает .txt: файл без расширения Windows открывать не умеет,
+; а двойной щелчок — единственный способ прочитать его, который придёт
+; в голову большинству.
+Source: "..\LICENSE-MIT"; DestDir: "{app}\licenses"; DestName: "LICENSE-MIT.txt"; Flags: ignoreversion
+Source: "..\LICENSE-APACHE"; DestDir: "{app}\licenses"; DestName: "LICENSE-APACHE.txt"; Flags: ignoreversion
+
+; Шесть шрифтов, вшитых в .exe. Два наших и четыре из egui: install_fonts
+; добавляет наши через FontInsert с приоритетом Highest, то есть поверх
+; встроенных, а не вместо них, — раздаются все шесть, и OFL с UFL требуют
+; сопровождать каждую копию текстом лицензии.
+;
+; Перечислены поимённо, а не маской "*.txt". Маска, под которую ничего
+; не попало, — это молча пустой каталог лицензий в установленной
+; программе; отсутствующий файл в явной строке останавливает компиляцию.
+;
+; DestName у четырёх последних: в общем каталоге имена OFL.txt и UFL.txt
+; не говорят, к какому шрифту относятся. В репозитории они, наоборот,
+; названы как в крейте — чтобы сверять копии по хешу, а не глазами.
+Source: "..\assets\fonts\Inter-OFL.txt"; DestDir: "{app}\licenses\fonts"; Flags: ignoreversion
+Source: "..\assets\fonts\JetBrainsMono-OFL.txt"; DestDir: "{app}\licenses\fonts"; Flags: ignoreversion
+Source: "..\assets\fonts\epaint_default_fonts\UFL.txt"; DestDir: "{app}\licenses\fonts"; DestName: "Ubuntu-UFL.txt"; Flags: ignoreversion
+Source: "..\assets\fonts\epaint_default_fonts\OFL.txt"; DestDir: "{app}\licenses\fonts"; DestName: "NotoEmoji-OFL.txt"; Flags: ignoreversion
+Source: "..\assets\fonts\epaint_default_fonts\Hack-Regular.txt"; DestDir: "{app}\licenses\fonts"; DestName: "Hack-LICENSE.txt"; Flags: ignoreversion
+Source: "..\assets\fonts\epaint_default_fonts\emoji-icon-font-mit-license.txt"; DestDir: "{app}\licenses\fonts"; DestName: "emoji-icon-font-MIT.txt"; Flags: ignoreversion
+
 [Icons]
 Name: "{group}\MdGlimpse"; Filename: "{app}\mdglimpse.exe"
 Name: "{group}\Удалить MdGlimpse"; Filename: "{uninstallexe}"
