@@ -47,6 +47,17 @@ use macos as sys;
 /// Если однажды здесь понадобится что-то из `std::os::unix`, трюк честно
 /// перестанет компилироваться — тогда его нужно убрать, а не чинить.
 #[cfg(test)]
+// `#[path = "."]` на inline-модуле задаёт каталог, относительно которого
+// ищутся его подмодули: это `src/platform/`, а не выдуманный
+// `src/platform/compiles_on_every_platform/`, которого на диске нет.
+//
+// Без него подмодулям пришлось бы писать `#[path = "../linux.rs"]`, и вот
+// это ломалось под Linux: путь
+// `src/platform/compiles_on_every_platform/../linux.rs` под Windows
+// открывается (Win32 сокращает `..` сам, ещё до обращения к диску),
+// а под Linux ядро идёт по компонентам слева направо и спотыкается
+// о несуществующий каталог. Тот же ENOENT получали и rustc, и rustfmt.
+#[path = "."]
 mod compiles_on_every_platform {
     // Подмодули пишут `use super::{..}`, и внутри обёртки `super` — это
     // она сама. Пробрасываем имена дальше, иначе они не найдутся.
@@ -54,12 +65,12 @@ mod compiles_on_every_platform {
     pub use super::{Association, Error, Result, EXTENSIONS};
 
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    #[path = "../linux.rs"]
+    #[path = "linux.rs"]
     #[allow(dead_code)]
     mod linux;
 
     #[cfg(not(target_os = "macos"))]
-    #[path = "../macos.rs"]
+    #[path = "macos.rs"]
     #[allow(dead_code)]
     mod macos;
 }

@@ -1,0 +1,115 @@
+# Проверки, которые обязаны пройти до того, как что-то попадёт в main.
+#
+# Тот же список, что в CLAUDE.md → «Команды проверки», плюс вторая
+# платформа. Смысл матрицы не в галочке «поддерживаем Linux»: под Windows
+# половина условной компиляции просто не заходит в #[cfg(unix)], и опечатка
+# там живёт незамеченной ровно до первого человека с Linux.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Права по умолчанию урезаем до чтения: проверкам больше ничего не нужно,
+# а токен с правом записи в репозиторий, лежащий в каждом прогоне, —
+# это лишняя поверхность на пустом месте.
+permissions:
+  contents: read
+
+# Новый пуш в ту же ветку отменяет предыдущий прогон. Release-сборка с
+# lto = true идёт долго, и держать в очереди заведомо устаревший коммит
+# незачем. Для main отмену не делаем: там каждый коммит должен быть проверен.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Бэктрейс в логе прогона: если тест упадёт, без него придётся
+  # перезапускать сборку только ради того, чтобы узнать, где именно.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Ключевая строка. С fail-fast: true падение Windows отменило бы
+      # Linux на середине, и мы бы так и не узнали, собирается он или нет.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: ubuntu-latest
+            name: Linux
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Системные заголовки для eframe. Список — тот же, что в README:
+      # если однажды окажется, что нужно что-то ещё, чинить надо оба места.
+      # Под Windows шаг не выполняется: там MSVC toolchain и всё.
+      - name: Системные зависимости (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev libxkbcommon-dev libwayland-dev
+
+      # Образы GitHub несут stable с clippy и rustfmt, но это их внутреннее
+      # дело: состав образа меняется без предупреждения. Ставим явно —
+      # шаг занимает секунды, если нужная версия уже на месте.
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Кеш сборки
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Своя запись кеша на каждую ОС, иначе Windows и Linux будут
+          # затирать друг другу target/ и кеш не даст ничего.
+          key: ${{ matrix.os }}
+          # Сохранять кеш даже при падении. Пока Linux-сборка не заведётся,
+          # каждый следующий заход иначе начинался бы с нуля: syntect
+          # и wgpu тянут за собой много кода и компилируются минутами.
+          cache-on-failure: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Без --ignored: тест регистрации в реестре помечен #[ignore]
+      # и обычным cargo test не запускается. Так и надо — он пишет
+      # в HKCU того, кто его запустил, а раннер общий.
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      # Инвариант из CLAUDE.md: две копии egui в дереве — это несовместимый
+      # набор версий и невнятные ошибки про типы. Проверяем машиной, а не
+      # памятью.
+      #
+      # `cargo tree -d` печатает ВСЕ дублирующиеся крейты, и их в дереве
+      # хватает — bit-set, syn, bit-vec приезжают в двух версиях через
+      # syntect и wgpu. Это нормально и нас не касается. Заголовок группы
+      # дубликатов стоит в нулевой колонке, поэтому якорь ^ отбирает
+      # ровно семейство egui и ничего больше.
+      - name: Дубликатов egui в дереве нет
+        shell: bash
+        run: |
+          if cargo tree -d | grep -E '^(eframe|egui|egui_extras|egui_commonmark|egui-wgpu|egui-winit|epaint|ecolor|emath)( |-| v)'; then
+            echo "::error::В дереве зависимостей несколько версий крейта из семейства egui"
+            exit 1
+          fi
+          echo "Дубликатов egui нет."
