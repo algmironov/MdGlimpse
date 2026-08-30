@@ -1,0 +1,64 @@
+# Конфигурация cargo-about. На сборку программы не влияет никак —
+# её читает только команда
+#   cargo about generate --fail --locked -o THIRD-PARTY-CRATES.md about.hbs
+
+# Порядок здесь — приоритет, а не алфавит: для дизъюнкции
+# «MIT OR Apache-2.0» будет выбрана MIT, потому что она выше.
+#
+# MIT первой по двум причинам. Под ней и так идёт большинство дерева,
+# и это одна из двух лицензий самого MdGlimpse — набор обязательств
+# получается наименьшим из возможных: сохранить уведомление.
+#
+# Apache-2.0 второй, но в отчёте будет всё равно: под ней и только под ней
+# идут winit, glutin и родня. Она же выигрывает у GPL-2.0-only в дизъюнкции
+# self_cell и обязательна в конъюнкции dpi (Apache-2.0 AND MIT).
+#
+# Дальше — те, у кого альтернативы нет вообще. Это ровно тот список,
+# который забывают и на котором генерация падает:
+#   BSD-3-Clause    tiny-skia, tiny-skia-path (Linux, рамка окна)
+#   BSD-2-Clause    приходят транзитивно
+#   ISC             libloading
+#   Zlib            foldhash
+#   BSL-1.0         clipboard-win, error-code (Windows, буфер обмена)
+#   Unicode-3.0     стек ICU, конъюнкция в unicode-ident
+#   OFL-1.1         конъюнкция в epaint_default_fonts
+#   Ubuntu-font-1.0 там же
+#
+# Unlicense (memchr, aho-corasick, walkdir) и 0BSD (adler2) в списке нет
+# намеренно: они всегда идут в дизъюнкции с MIT, а MIT выше.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# Ровно те две платформы, для которых собираются релизы. Крейты,
+# подключённые через несовпавший cfg() — objc2, core-graphics, web-sys
+# и прочая macOS/wasm-родня, — в отчёт не попадут: их кода
+# в раздаваемых бинарниках нет.
+#
+# Таргеты вычисляются разом, то есть отчёт получается объединением двух
+# платформ. Это и нужно: файл один на оба релиза.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Отсекается всё, что не доживает до готовой программы: winresource,
+# gl_generator, khronos_api, cfg_aliases работают во время сборки.
+# ron объявлен в dev-dependencies, но в отчёте останется — его же тянет
+# eframe с фичей persistence, а «ignore» относится только к крейтам,
+# которые ТОЛЬКО build- или только dev-.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Транзитивные нужны: в бинарник линкуется всё дерево, а не только то,
+# что перечислено в нашем Cargo.toml.
+ignore-transitive-dependencies = false
